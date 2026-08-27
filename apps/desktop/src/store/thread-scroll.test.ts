@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
+import { rescopeConnectionScopedStores } from '@/lib/connection-scoped'
 import { setActiveProfile } from '@/store/profile'
 
 import {
@@ -143,10 +144,75 @@ describe('per-session scroll persistence', () => {
     expect(getThreadScrollPosition('arrayEntry')).toBeUndefined()
   })
 
+  it('drops a persisted negative fromBottom as corrupt', () => {
+    window.localStorage.setItem(
+      threadScrollStorageKey('default'),
+      JSON.stringify({
+        good: { fromBottom: 240, kind: 'offset' },
+        negative: { fromBottom: -5, kind: 'offset' }
+      })
+    )
+
+    expect(getThreadScrollPosition('good')).toEqual({ fromBottom: 240, kind: 'offset' })
+    expect(getThreadScrollPosition('negative')).toBeUndefined()
+  })
+
   it('persists bottom state as a first-class entry', () => {
     saveThreadScrollPosition('session-a', THREAD_SCROLL_BOTTOM)
 
     expect(getThreadScrollPosition('session-a')).toEqual(THREAD_SCROLL_BOTTOM)
+  })
+})
+
+describe('connection-scoped scroll persistence (#77318)', () => {
+  const remoteA = () =>
+    rescopeConnectionScopedStores({ baseUrl: 'https://gw-a.example:8443', mode: 'remote', profile: 'default' })
+
+  const remoteB = () =>
+    rescopeConnectionScopedStores({ baseUrl: 'https://gw-b.example:8443', mode: 'remote', profile: 'default' })
+
+  afterEach(() => {
+    rescopeConnectionScopedStores({ mode: 'local' })
+  })
+
+  it('does not share saved state between two remote scopes with the same profile', () => {
+    remoteA()
+    saveThreadScrollPosition('session-a', { fromBottom: 240, kind: 'offset' })
+
+    remoteB()
+    expect(getThreadScrollPosition('session-a')).toBeUndefined()
+  })
+
+  it('isolates saves: writing in one scope does not alter another', () => {
+    remoteA()
+    saveThreadScrollPosition('session-a', { fromBottom: 240, kind: 'offset' })
+
+    remoteB()
+    saveThreadScrollPosition('session-a', { fromBottom: 480, kind: 'offset' })
+
+    remoteA()
+    expect(getThreadScrollPosition('session-a')).toEqual({ fromBottom: 240, kind: 'offset' })
+  })
+
+  it('isolates clear: clearing in one scope does not affect another', () => {
+    remoteA()
+    saveThreadScrollPosition('session-a', { fromBottom: 240, kind: 'offset' })
+
+    remoteB()
+    saveThreadScrollPosition('session-a', { fromBottom: 480, kind: 'offset' })
+    clearThreadScrollPosition('session-a')
+
+    remoteA()
+    expect(getThreadScrollPosition('session-a')).toEqual({ fromBottom: 240, kind: 'offset' })
+  })
+
+  it('same-scope round-trip still works (regression guard)', () => {
+    remoteA()
+    saveThreadScrollPosition('session-a', { fromBottom: 240, kind: 'offset' })
+    expect(getThreadScrollPosition('session-a')).toEqual({ fromBottom: 240, kind: 'offset' })
+
+    clearThreadScrollPosition('session-a')
+    expect(getThreadScrollPosition('session-a')).toBeUndefined()
   })
 })
 
