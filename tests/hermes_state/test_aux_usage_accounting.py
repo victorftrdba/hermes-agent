@@ -221,7 +221,12 @@ class TestAmbientAccountingContext:
         db.create_session("s1", source="cli")
         token = set_accounting_context(db, "s1")
         try:
-            out = _validate_llm_response(_mk_response(), "web_extract", provider="openrouter")
+            out = _validate_llm_response(
+                _mk_response(),
+                "web_extract",
+                provider="openrouter",
+                base_url="https://openrouter.test/v1",
+            )
         finally:
             reset_accounting_context(token)
         assert out is not None
@@ -229,6 +234,71 @@ class TestAmbientAccountingContext:
         assert len(rows) == 1
         assert rows[0]["task"] == "web_extract"
         assert rows[0]["billing_provider"] == "openrouter"
+        assert rows[0]["billing_base_url"] == "https://openrouter.test/v1"
+        assert rows[0]["api_call_count"] == 1
+
+    def test_validate_llm_response_records_recovered_response_once(self, db):
+        from agent.aux_accounting import (
+            reset_accounting_context,
+            set_accounting_context,
+        )
+        from agent.auxiliary_client import _validate_llm_response
+
+        response = {
+            "model": "recovered-model",
+            "output_text": "Recovered content",
+            "usage": SimpleNamespace(
+                prompt_tokens=8,
+                completion_tokens=3,
+                total_tokens=11,
+            ),
+        }
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            out = _validate_llm_response(
+                response,
+                "vision",
+                provider="responses-provider",
+                base_url="https://responses.test/v1",
+            )
+        finally:
+            reset_accounting_context(token)
+
+        assert out.choices[0].message.content == "Recovered content"
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        assert rows[0]["task"] == "vision"
+        assert rows[0]["model"] == "recovered-model"
+        assert rows[0]["billing_provider"] == "responses-provider"
+        assert rows[0]["billing_base_url"] == "https://responses.test/v1"
+        assert rows[0]["input_tokens"] == 8
+        assert rows[0]["output_tokens"] == 3
+        assert rows[0]["api_call_count"] == 1
+
+    def test_validate_llm_response_rejects_without_recording_usage(self, db):
+        from agent.aux_accounting import (
+            reset_accounting_context,
+            set_accounting_context,
+        )
+        from agent.auxiliary_client import _validate_llm_response
+
+        response = _mk_response(model="invalid-model")
+        response.choices = []
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            with pytest.raises(RuntimeError, match="LLM returned invalid response"):
+                _validate_llm_response(
+                    response,
+                    "vision",
+                    provider="invalid-provider",
+                    base_url="https://invalid.test/v1",
+                )
+        finally:
+            reset_accounting_context(token)
+
+        assert _usage_rows(db, "s1") == []
 
 
 
@@ -295,4 +365,3 @@ class TestInsightsAuxTotals:
         assert ov["total_output_tokens"] == 600
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
-
