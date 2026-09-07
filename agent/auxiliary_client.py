@@ -9610,7 +9610,6 @@ def _validate_llm_response(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
     from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -9620,20 +9619,22 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
-            _record_relay_auxiliary_response_model(response)
-            _complete_relay_auxiliary_call()
-            return recovered
-        response_type = type(response).__name__
-        response_preview = str(response)[:120]
-        raise RuntimeError(
-            f"Auxiliary {task or 'call'}: LLM returned invalid response "
-            f"(type={response_type}): {response_preview!r}. "
-            f"Expected object with .choices[0].message — check provider "
-            f"adapter or custom endpoint compatibility."
-        ) from exc
+            accepted_response = recovered
+        else:
+            response_type = type(response).__name__
+            response_preview = str(response)[:120]
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'}: LLM returned invalid response "
+                f"(type={response_type}): {response_preview!r}. "
+                f"Expected object with .choices[0].message — check provider "
+                f"adapter or custom endpoint compatibility."
+            ) from exc
+    else:
+        accepted_response = response
+    record_aux_usage(accepted_response, task, provider=provider, base_url=base_url)
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
-    return response
+    return accepted_response
 
 
 def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
@@ -9689,18 +9690,18 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
 
     choice = SimpleNamespace(
         message=SimpleNamespace(content=text),
-        finish_reason=getattr(response, "finish_reason", None) or "stop",
+        finish_reason=_obj_get(response, "finish_reason") or "stop",
     )
     try:
         response.choices = [choice]
         return response
     except Exception:
         return SimpleNamespace(
-            id=getattr(response, "id", ""),
-            model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"),
+            id=_obj_get(response, "id", ""),
+            model=_obj_get(response, "model", ""),
+            object=_obj_get(response, "object", "chat.completion"),
             choices=[choice],
-            usage=getattr(response, "usage", None),
+            usage=_obj_get(response, "usage"),
         )
 
 

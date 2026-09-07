@@ -13,6 +13,7 @@ import queue
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, mock_open
 
 import pytest
@@ -489,6 +490,65 @@ class TestPreprocessImagesWithVision:
             result = cli._preprocess_images_with_vision("check this", [img])
         assert isinstance(result, str)
         assert str(img) in result  # path still included for retry
+
+    def test_vision_usage_records_cli_session_and_restores_outer_context(self, cli, tmp_path):
+        import json
+
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("outer-session", source="cli")
+        db.create_session("vision-session", source="cli")
+        cli._session_db = db
+        cli.session_id = "vision-session"
+        response = SimpleNamespace(
+            model="vision-model",
+            usage=SimpleNamespace(
+                prompt_tokens=37,
+                completion_tokens=11,
+                total_tokens=48,
+            ),
+        )
+
+        async def _fake_vision(**kwargs):
+            record_aux_usage(response, "vision", provider="vision-provider")
+            return json.dumps({"success": True, "analysis": "Accounted image"})
+
+        outer_token = set_accounting_context(db, "outer-session")
+        try:
+            img = self._make_image(tmp_path)
+            with patch("tools.vision_tools.vision_analyze_tool", side_effect=_fake_vision):
+                cli._preprocess_images_with_vision("Describe this", [img], announce=False)
+            record_aux_usage(response, "web_extract", provider="outer-provider")
+        finally:
+            reset_accounting_context(outer_token)
+
+        with db._lock:
+            vision_rows = db._conn.execute(
+                "SELECT * FROM session_model_usage WHERE session_id = ?",
+                ("vision-session",),
+            ).fetchall()
+            outer_rows = db._conn.execute(
+                "SELECT * FROM session_model_usage WHERE session_id = ?",
+                ("outer-session",),
+            ).fetchall()
+        db.close()
+
+        assert len(vision_rows) == 1
+        vision_row = dict(vision_rows[0])
+        assert vision_row["task"] == "vision"
+        assert vision_row["model"] == "vision-model"
+        assert vision_row["billing_provider"] == "vision-provider"
+        assert vision_row["input_tokens"] == 37
+        assert vision_row["output_tokens"] == 11
+        assert vision_row["api_call_count"] == 1
+        assert len(outer_rows) == 1
+        assert dict(outer_rows[0])["task"] == "web_extract"
 
 
 # ═════════════════════════════════════════════════════════════════════════
