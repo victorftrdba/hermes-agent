@@ -46,7 +46,11 @@ The Docker workflow is successful only because its classifier ran; build and pub
 
 Public standard Linux and Windows hosted runners provide four CPUs. Python therefore runs four test-file workers on forks, while upstream retains 96. The existing Python workflow documents a whole-suite mean of 126 seconds at 96 workers. A conservative linear throughput extrapolation to four workers is `126 * 96 / 4 = 3024` seconds, or 50.4 minutes. The fork-only Python job timeout is 60 minutes to accommodate that estimate and setup; upstream retains 30 minutes. This is a capacity estimate, not an observed fork duration or a completion guarantee.
 
-The existing JS workspace scheduler already defaults to `min(units.length, availableParallelism())`; no scheduler or command change is necessary. Other workflow timeouts remain unchanged until execution provides evidence for an adjustment.
+The existing JS workspace scheduler defaults to `min(units.length, availableParallelism())`, but each check can also start its own Vitest worker pool. Hosted job `101696543975` at PR head `0a17dcbcf0` ran ten checks with an outer limit of four. Web ran from 09:47:17 to 09:47:44 UTC and TUI from 09:46:58 to 09:47:59 UTC while desktop UI and desktop lint also remained active. Locked Vitest 4.1.10 defaults each non-watch pool to `availableParallelism() - 1`: up to three test workers per check, or nine across those three Vitest invocations, plus lint and coordinators on four CPUs.
+
+Eight checks passed. Web's `SessionsPage.test.tsx` exceeded its existing 5000ms test timeout at 5126ms. TUI's `virtualHistoryOffsetCache.test.ts` observed no scroll compensation after its existing 40ms delay. Both unchanged files passed in isolation on macOS with locked dependencies: web 1/1 (695ms test duration), TUI 17/17. This supports resource contention as a contributor, but does not prove causality or a hosted fix.
+
+Forks therefore pass the scheduler's existing `--concurrency 1` option. Upstream retains its argument-free invocation. The scheduler, discovery, inner test commands, assertions, failure aggregation, and 30-minute JS job timeout remain unchanged. The mitigation still requires a successful hosted run. Other workflow timeouts remain unchanged until execution provides evidence for an adjustment.
 
 ## One-PR Plan
 
@@ -62,4 +66,5 @@ Standard hosted runners have fewer resources; the full suite or Nix closure may 
 - Queued PR CI: https://github.com/victorftrdba/hermes-agent/actions/runs/34103111436
 - Queued PR Nix: https://github.com/victorftrdba/hermes-agent/actions/runs/34103110433
 - Pending merged-main CI: https://github.com/victorftrdba/hermes-agent/actions/runs/34103638722
+- First assigned fork JS job: https://github.com/victorftrdba/hermes-agent/actions/runs/34107720734/job/101696543975
 - GitHub runner availability: https://docs.github.com/en/actions/reference/runners/github-hosted-runners

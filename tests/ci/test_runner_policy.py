@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -47,21 +48,18 @@ def _evaluate(value: object, repository: str, matrix: dict | None = None) -> obj
         return _evaluate(matrix[reference.group(1)], repository, matrix)
     literal = r"(?:'[^']*'|[0-9]+)"
     condition = re.fullmatch(
-        rf"github\.repository\s*==\s*'([^']*)'\s*&&\s*({literal})\s*\|\|\s*({literal})",
+        rf"github\.repository\s*(==|!=)\s*'([^']*)'\s*&&\s*({literal})\s*\|\|\s*({literal})",
         body,
     )
     assert condition, f"Unsupported runner-policy expression: {value}"
-    expected_repository, upstream, fork = condition.groups()
+    operator, expected_repository, when_true, when_false = condition.groups()
 
     def parse_literal(token: str) -> str | int:
         return token[1:-1] if token.startswith("'") else int(token)
 
-    selected = (
-        parse_literal(upstream)
-        if repository.casefold() == expected_repository.casefold()
-        else False
-    )
-    return selected or parse_literal(fork)
+    matches = repository.casefold() == expected_repository.casefold()
+    selected = parse_literal(when_true) if matches == (operator == "==") else False
+    return selected or parse_literal(when_false)
 
 
 @pytest.mark.parametrize("repository", _REPOSITORIES)
@@ -97,3 +95,17 @@ def test_macos_lane_keeps_its_native_runner(repository):
     job = _job("tests-os.yml", "os-tests")
     matrix = next(row for row in job["strategy"]["matrix"]["include"] if row["marker"] == "macos_only")
     assert _evaluate(job["runs-on"], repository, matrix) == "macos-latest"
+
+
+@pytest.mark.parametrize("repository", _REPOSITORIES)
+def test_workspace_scheduler_limits_forks_without_changing_upstream(repository):
+    job = _job("js-tests.yml", "check")
+    step = next(step for step in job["steps"] if step.get("name") == "Run all workspace checks")
+    command = re.sub(
+        r"\$\{\{.*?\}\}",
+        lambda expression: str(_evaluate(expression.group(), repository)),
+        step["run"],
+        flags=re.DOTALL,
+    )
+    expected_args = [] if repository.casefold() == _UPSTREAM.casefold() else ["--concurrency", "1"]
+    assert shlex.split(command) == ["node", ".github/scripts/run-workspace-checks.mjs", *expected_args]
