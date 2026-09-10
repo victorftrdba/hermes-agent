@@ -521,6 +521,10 @@ def _resolve_child_runtime(
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
     }
+    kwargs["provider_require_parameters"] = (
+        getattr(parent_agent, "provider_require_parameters", False)
+        if (effective_provider or "").strip().lower() == "openrouter" else False
+    )
     if not override_provider:
         kwargs["provider_data_collection"] = kwargs["provider_data_collection"] or ""
     child_max_tokens = getattr(parent_agent, "max_tokens", None)

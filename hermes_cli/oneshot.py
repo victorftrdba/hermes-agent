@@ -416,12 +416,15 @@ def _run_agent(
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
     ``(final_response, run_result)``. Imports are local to keep CLI startup cheap."""
-    from hermes_cli.config import load_config
+    from hermes_cli.config import load_config, resolve_turn_limit
+    from hermes_constants import resolve_reasoning_config
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
     cfg = load_config()
+    agent_cfg = cfg.get("agent", {}) or {}
+    provider_routing = cfg.get("provider_routing", {}) or {}
     choice = _resolve_model_and_provider(cfg, model, provider)
     # Resume resolves BEFORE the runtime provider: the session's stored model/route must
     # replace the ambient config (see _apply_stored_session_runtime) and the ended row must
@@ -466,6 +469,16 @@ def _run_agent(
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=choice.model,
+            reasoning_config=resolve_reasoning_config(cfg, choice.model),
+            max_iterations=resolve_turn_limit(agent_cfg.get("max_turns", cfg.get("max_turns"))),
+            run_budget_seconds=agent_cfg.get("run_budget_seconds"),
+            providers_allowed=provider_routing.get("only"),
+            providers_ignored=provider_routing.get("ignore"),
+            providers_order=provider_routing.get("order"),
+            provider_sort=provider_routing.get("sort"),
+            provider_require_parameters=provider_routing.get("require_parameters", False),
+            provider_data_collection=provider_routing.get("data_collection"),
+            openrouter_min_coding_score=(cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",

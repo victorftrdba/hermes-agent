@@ -12,6 +12,9 @@ must run on the session's stored model/provider runtime and on a reopened sessio
 
 from __future__ import annotations
 
+import json
+import os
+
 import pytest
 
 from hermes_state import SessionDB
@@ -266,3 +269,81 @@ class TestRunOneshotForwardsResume:
         assert rc == 0
         assert captured["prompt"] == "hello"
         assert captured["resume"] == "sess-1"
+
+
+@pytest.mark.parametrize("override,expected", [
+    (None, {"enabled": True, "effort": "max"}),
+    ("xhigh", {"enabled": True, "effort": "xhigh"}),
+    (False, {"enabled": False}),
+])
+def test_oneshot_honors_active_runtime_policy(tmp_path, monkeypatch, override, expected):
+    from hermes_cli import main as cli_main
+    from hermes_cli._parser import build_top_level_parser
+    from model_tools import handle_function_call
+    from providers import get_provider_profile
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("HERMES_IGNORE_RULES", "1")
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.chdir(tmp_path)
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    target = fixture / "example.txt"
+    target.write_text("before\n", encoding="utf-8")
+    config = {
+        "model": {"default": "test/model", "provider": "openrouter"},
+        "agent": {"reasoning_effort": "max", "reasoning_overrides": {"test/model": override},
+                  "max_turns": 7, "run_budget_seconds": 42},
+        "provider_routing": {"only": ["test-provider"], "ignore": ["other-provider"],
+                             "order": ["test-provider"], "sort": "latency",
+                             "require_parameters": True, "data_collection": "deny"},
+        "mcp_servers": {},
+        "openrouter": {"min_coding_score": 0.73},
+        "terminal": {"backend": "local", "cwd": "."},
+    }
+    (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run_conversation(self, prompt, conversation_history=None):
+            captured["cwd"] = os.getcwd()
+            captured["read"] = json.loads(handle_function_call(
+                "read_file", {"path": str(target)}, task_id=tmp_path.name))
+            captured["write"] = json.loads(handle_function_call(
+                "write_file", {"path": str(target), "content": "after\n"}, task_id=tmp_path.name))
+            return {"final_response": "ok"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(cli_main, "_run_and_exit_oneshot", lambda *a, **kw: captured.update(exit_code=run_oneshot(*a, **kw)))
+    parser, _, _ = build_top_level_parser()
+    cli_main._run_oneshot_from_args(parser.parse_args(["-z", "hello", "--in", str(fixture), "-t", "file"]))
+    assert captured["exit_code"] == 0
+    assert captured["cwd"] == str(fixture)
+    assert "error" not in captured["read"] and "before" in captured["read"]["content"]
+    assert "error" not in captured["write"] and target.read_text(encoding="utf-8") == "after\n"
+    assert captured["enabled_toolsets"] == ["file"]
+    assert captured["reasoning_config"] == expected
+    assert captured["max_iterations"] == 7
+    assert captured["run_budget_seconds"] == 42
+    assert captured["openrouter_min_coding_score"] == config["openrouter"]["min_coding_score"]
+    for model in ("openrouter/pareto-code", "test/model"):
+        body = get_provider_profile("openrouter").build_extra_body(
+            model=model, openrouter_min_coding_score=captured["openrouter_min_coding_score"])
+        if model == "openrouter/pareto-code":
+            assert body["plugins"] == [{"id": "pareto-router", "min_coding_score": 0.73}]
+        else:
+            assert "plugins" not in body
+    for argument, key in (("providers_allowed", "only"), ("providers_ignored", "ignore"),
+                          ("providers_order", "order"), ("provider_sort", "sort"),
+                          ("provider_require_parameters", "require_parameters"),
+                          ("provider_data_collection", "data_collection")):
+        assert captured[argument] == config["provider_routing"][key]

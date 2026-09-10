@@ -31,6 +31,29 @@ def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
     shell_hooks._record_approval(event, command)
 
 
+@pytest.mark.parametrize("event,closed,code,stdout,blocked", [
+    ("pre_tool_call", True, 1, "", True),
+    ("pre_tool_call", True, 1, "  ", True),
+    ("pre_tool_call", True, 0, "", False),
+    ("pre_tool_call", True, 0, "{}", False),
+    ("pre_tool_call", False, 1, "", False),
+    ("post_tool_call", True, 1, "", False),
+])
+def test_empty_exit_policy_through_real_hook(tmp_path, monkeypatch, event, closed, code, stdout, blocked):
+    import shlex
+    import sys
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    script = tmp_path / "hook.py"
+    script.write_text(f"import sys\nsys.stdout.write({stdout!r})\nsys.exit({code})\n", encoding="utf-8")
+    spec = shell_hooks.ShellHookSpec(
+        event=event, command=shlex.join([sys.executable, str(script)]), fail_closed=closed,
+    )
+    result = shell_hooks.run_once(spec, {"tool_name": "read_file", "args": {"path": "fixture.txt"}})
+    assert result["returncode"] == code
+    assert (result["parsed"] is not None and result["parsed"].get("action") == "block") is blocked
+
+
 @pytest.fixture(autouse=True)
 def _reset_registration_state():
     shell_hooks.reset_for_tests()

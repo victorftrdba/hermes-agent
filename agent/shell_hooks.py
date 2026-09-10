@@ -341,7 +341,8 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
 def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """``_spawn`` result → hook contribution (live callback and ``run_once``). Spawn error/timeout fail
     open unless fail_closed; exit 2 on a blocking event blocks (message: stdout JSON, then stderr, then
-    default); other non-zero exits warn then parse stdout; unparseable stdout on a fail_closed hook blocks."""
+    default); other non-zero exits warn then parse stdout; empty failed output and unparseable stdout
+    on a fail_closed hook block."""
     blocking_event = spec.event in _BLOCKING_EVENTS
     fail_closed = spec.fail_closed and blocking_event
     if r["error"]:
@@ -365,6 +366,8 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[st
         logger.warning("shell hook exited %d (event=%s command=%s); stderr=%s",
                        r["returncode"], spec.event, spec.command, stderr[:_STDERR_MESSAGE_LIMIT])
     stdout = (r["stdout"] or "").strip()
+    if fail_closed and r["returncode"] != 0 and not stdout:
+        return _fail_closed_block(spec, f"exited {r['returncode']} without a directive")
     parsed = _parse_response(spec.event, stdout)
     if parsed is None and fail_closed and stdout and not _is_json_object(stdout):
         # A fail-closed gate must not silently allow on garbage stdout (e.g. a stack trace).

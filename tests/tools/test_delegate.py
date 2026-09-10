@@ -34,6 +34,35 @@ from tools.delegate_tool import (
 from hermes_state import SessionDB
 
 
+def test_pinned_openrouter_child_keeps_parameter_contract(tmp_path, monkeypatch):
+    from agent.chat_completion_helpers import _provider_preferences_for_agent
+    from tools.delegate_tool_config import _resolve_child_runtime
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(json.dumps({
+        "provider_routing": {"models": {"child/relaxed": {"require_parameters": False}}},
+    }), encoding="utf-8")
+    parent = _make_mock_parent()
+    parent.provider_require_parameters = True
+    parent.provider_data_collection = "deny"
+    parent.providers_allowed = ["parent-only"]
+    parent.providers_ignored = ["parent-ignore"]
+    parent.providers_order = ["parent-first"]
+    parent.provider_sort = "latency"
+    for provider, model, expected in (("openrouter", "child/strict", True),
+                                       ("openrouter", "child/relaxed", None),
+                                       ("anthropic", "child/strict", None)):
+        kwargs = _resolve_child_runtime(
+            parent, {}, "test-key", model=model, override_provider=provider,
+            override_base_url=None, override_api_key="child-key", override_api_mode=None,
+            override_acp_command=None, override_acp_args=None,
+        )
+        child = types.SimpleNamespace(**kwargs)
+        assert _provider_preferences_for_agent(child).get("require_parameters") is expected
+        for attribute in ("providers_allowed", "providers_ignored", "providers_order", "provider_sort"):
+            assert getattr(child, attribute) is None
+
+
 def _make_mock_parent(depth=0):
     """Create a mock parent agent with the fields delegate_task expects."""
     parent = MagicMock()
@@ -413,9 +442,7 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
-                self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
-                )
+                self.assertTrue(os.path.samefile(child_db.db_path, parent_db.db_path))
             finally:
                 if child_db is not None:
                     child_db.close()
