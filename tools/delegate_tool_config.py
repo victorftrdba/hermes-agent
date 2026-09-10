@@ -403,6 +403,57 @@ def _load_config() -> dict:
     except Exception:
         return {}
 
+
+_NAMED_ROUTE_KEYS = frozenset({"provider", "model", "reasoning_effort"})
+
+
+def _validate_named_route(name: Any, route: Any) -> Optional[Dict[str, Any]]:
+    """Return a fresh selection without credentials or transport overrides, or None if malformed."""
+    if not isinstance(name, str) or not name or name != name.strip():
+        return None
+    if not isinstance(route, dict) or set(route) != _NAMED_ROUTE_KEYS:
+        return None
+    provider, model = route["provider"], route["model"]
+    if any(not isinstance(value, str) or not value or value != value.strip() for value in (provider, model)):
+        return None
+    effort = route["reasoning_effort"]
+    if not isinstance(effort, str) and effort is not False:
+        return None
+    from hermes_constants import parse_reasoning_effort
+    if parse_reasoning_effort(effort) is None:
+        return None
+    return {"provider": provider, "model": model, "reasoning_effort": effort}
+
+
+def _valid_named_routes(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """The safely exposable ``delegation.routes`` subset: ``name -> validated route``.
+
+    Malformed entries are excluded (never repaired); nothing is offered when no valid route exists.
+    """
+    routes = cfg.get("routes") if isinstance(cfg, dict) else None
+    if not isinstance(routes, dict):
+        return {}
+    return {
+        name: validated
+        for name, route in routes.items()
+        if (validated := _validate_named_route(name, route)) is not None
+    }
+
+
+def _resolve_named_route(name: Any, cfg: dict) -> Dict[str, Any]:
+    """Resolve an exact configured name before credential resolution or child construction."""
+    if not isinstance(name, str) or not name or name != name.strip():
+        raise ValueError("delegate_task route must be a named route from delegation.routes.")
+    routes = _valid_named_routes(cfg)
+    route = routes.get(name)
+    if route is None:
+        available = ", ".join(sorted(routes))
+        raise ValueError(
+            f"Unknown or malformed delegate route '{name}'. "
+            f"Configured named routes: {available or 'none'}."
+        )
+    return route
+
 # OpenRouter routing filters: inherited from the parent, but reset to these defaults under a pinned provider — parent
 # filters (e.g. only=["Anthropic"]) would silently force the child back onto the parent's provider.
 # openrouter_min_coding_score stays inherited: model-gated, no-op elsewhere.
@@ -439,6 +490,7 @@ def _resolve_child_runtime(
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
     routing_cfg: Optional[Dict[str, Any]] = None,
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
     are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
@@ -505,6 +557,8 @@ def _resolve_child_runtime(
                 child_reasoning = parsed
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
+    if override_reasoning_config is not None:
+        child_reasoning = dict(override_reasoning_config)
 
     kwargs: Dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,

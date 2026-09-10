@@ -31,7 +31,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_child_runtime, _resolve_delegation_credentials, _resolve_named_route, _valid_named_routes,
     _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
@@ -176,6 +176,7 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -220,6 +221,7 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        override_reasoning_config=override_reasoning_config,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -361,6 +363,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list,
+    override_reasoning_config: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -374,6 +377,8 @@ def _build_children(
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
     }
+    if override_reasoning_config is not None:
+        overrides["override_reasoning_config"] = override_reasoning_config
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -412,11 +417,14 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
-    (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    (per-task beats top-level; capability is depth-derived). ``route`` (optional) selects one named
+    ``delegation.routes`` worker for the WHOLE call/batch: an unknown or malformed selection fails closed
+    (returned as a tool error) before any credential resolution or child construction. Returns JSON with one
+    results entry per task, or a dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -459,7 +467,16 @@ def delegate_task(
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    override_reasoning_config = None
+    if route is not None:
+        try:
+            routing_cfg = _resolve_named_route(route, cfg)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        from hermes_constants import parse_reasoning_effort
+        override_reasoning_config = parse_reasoning_effort(routing_cfg["reasoning_effort"])
+    else:
+        routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -486,6 +503,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers,
+        override_reasoning_config=override_reasoning_config,
     )
     if err:
         return tool_error(err)
@@ -584,6 +602,19 @@ def _build_dynamic_schema_overrides() -> dict:
         tasks["items"] = {**tasks["items"], "properties": {
             k: v for k, v in tasks["items"]["properties"].items() if k != "group"
         }}
+
+    named_routes = _valid_named_routes(_load_config())
+    if named_routes:
+        overrides_params["properties"]["route"] = _p(
+            "string",
+            "Explicit worker selection: run ALL subagents of this call on the named "
+            "delegation.routes route instead of the default child route. The route fixes the "
+            "children's provider, model and reasoning effort; every other delegation setting "
+            "(limits, timeouts, tools, budgets) still follows delegation config. Omit to keep "
+            "the configured delegation defaults. Configured routes: "
+            + ", ".join(sorted(named_routes)) + ".",
+            enum=sorted(named_routes),
+        )
 
     return {
         "description": _build_top_level_description(independent_completions=independent_completions),
@@ -697,7 +728,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        parent_agent=kw.get("parent_agent"), route=args.get("route"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",
