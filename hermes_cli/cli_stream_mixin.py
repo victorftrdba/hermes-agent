@@ -567,50 +567,57 @@ class CLIStreamMixin:
         from cli import _DIM, _RST, _cprint
         import asyncio as _asyncio
         from tools.vision_tools import vision_analyze_tool
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, data, objects, people, layout, colors, "
-            "and any other notable visual information.")
-        enriched_parts = []
-        for img_path in images:
-            if not img_path.exists():
-                continue
-            size_kb = img_path.stat().st_size // 1024
-            if announce:
-                _cprint(f"  {_DIM}👁️  analyzing {img_path.name} ({size_kb}KB)...{_RST}")
-            try:
-                result_json = _asyncio.run(
-                    vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt))
-                result = json.loads(result_json)
-                if result.get("success"):
-                    description = result.get("analysis", "")
+        from agent.aux_accounting import reset_accounting_context, set_accounting_context
+        token = set_accounting_context(
+            getattr(self, "_session_db", None), getattr(self, "session_id", None)
+        )
+        try:
+            analysis_prompt = (
+                "Describe everything visible in this image in thorough detail. "
+                "Include any text, code, data, objects, people, layout, colors, "
+                "and any other notable visual information.")
+            enriched_parts = []
+            for img_path in images:
+                if not img_path.exists():
+                    continue
+                size_kb = img_path.stat().st_size // 1024
+                if announce:
+                    _cprint(f"  {_DIM}👁️  analyzing {img_path.name} ({size_kb}KB)...{_RST}")
+                try:
+                    result_json = _asyncio.run(
+                        vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt))
+                    result = json.loads(result_json)
+                    if result.get("success"):
+                        description = result.get("analysis", "")
+                        enriched_parts.append(
+                            f"[The user attached an image. Here's what it contains:\n{description}]\n"
+                            f"[If you need a closer look, use vision_analyze with "
+                            f"image_url: {img_path}]")
+                        if announce:
+                            _cprint(f"  {_DIM}✓ image analyzed{_RST}")
+                    else:
+                        enriched_parts.append(
+                            f"[The user attached an image but it couldn't be analyzed. "
+                            f"You can try examining it with vision_analyze using "
+                            f"image_url: {img_path}]")
+                        if announce:
+                            _cprint(f"  {_DIM}⚠ vision analysis failed — path included for retry{_RST}")
+                except Exception as e:
                     enriched_parts.append(
-                        f"[The user attached an image. Here's what it contains:\n{description}]\n"
-                        f"[If you need a closer look, use vision_analyze with "
-                        f"image_url: {img_path}]")
-                    if announce:
-                        _cprint(f"  {_DIM}✓ image analyzed{_RST}")
-                else:
-                    enriched_parts.append(
-                        f"[The user attached an image but it couldn't be analyzed. "
+                        f"[The user attached an image but analysis failed ({e}). "
                         f"You can try examining it with vision_analyze using "
                         f"image_url: {img_path}]")
                     if announce:
-                        _cprint(f"  {_DIM}⚠ vision analysis failed — path included for retry{_RST}")
-            except Exception as e:
-                enriched_parts.append(
-                    f"[The user attached an image but analysis failed ({e}). "
-                    f"You can try examining it with vision_analyze using "
-                    f"image_url: {img_path}]")
-                if announce:
-                    _cprint(f"  {_DIM}⚠ vision analysis error — path included for retry{_RST}")
+                        _cprint(f"  {_DIM}⚠ vision analysis error — path included for retry{_RST}")
 
-        # Vision descriptions first, then the user's original text
-        user_text = text if isinstance(text, str) and text else ""
-        if enriched_parts:
-            prefix = "\n\n".join(enriched_parts)
-            return f"{prefix}\n\n{user_text}" if user_text else prefix
-        return user_text or "What do you see in this image?"
+            # Vision descriptions first, then the user's original text
+            user_text = text if isinstance(text, str) and text else ""
+            if enriched_parts:
+                prefix = "\n\n".join(enriched_parts)
+                return f"{prefix}\n\n{user_text}" if user_text else prefix
+            return user_text or "What do you see in this image?"
+        finally:
+            reset_accounting_context(token)
 
     def _console_print(self, *args, **kwargs):
         """Print through the active command-safe console (prompt_toolkit-safe Rich once the

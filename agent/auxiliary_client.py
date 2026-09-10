@@ -6079,7 +6079,6 @@ def _validate_llm_response(
     if response is None:
         raise RuntimeError(f"Auxiliary {task or 'call'}: LLM returned None response")
     from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Adapter SimpleNamespace responses are fine — they have .choices[0].message.
     try:
         choices = response.choices
@@ -6094,6 +6093,7 @@ def _validate_llm_response(
                 f"adapter or custom endpoint compatibility."
             ) from exc
         response = recovered
+    record_aux_usage(response, task, provider=provider, base_url=base_url)
     # Retain the provider-reported model for terminal relay route attribution.
     context = _RELAY_AUX_CALL_CONTEXT.get()
     if context is not None:
@@ -6132,15 +6132,20 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
     text = _extract_aux_response_text(response)
     if not text:
         return None
-    choice = SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=getattr(response, "finish_reason", None) or "stop")
+    choice = SimpleNamespace(
+        message=SimpleNamespace(content=text),
+        finish_reason=_field(response, "finish_reason") or "stop",
+    )
     try:
         response.choices = [choice]
         return response
     except Exception:
         return SimpleNamespace(
-            id=getattr(response, "id", ""), model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"), choices=[choice],
-            usage=getattr(response, "usage", None),
+            id=_field(response, "id", ""),
+            model=_field(response, "model", ""),
+            object=_field(response, "object", "chat.completion"),
+            choices=[choice],
+            usage=_field(response, "usage"),
         )
 
 
