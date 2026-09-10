@@ -237,22 +237,25 @@ class TestAmbientAccountingContext:
         assert rows[0]["billing_base_url"] == "https://openrouter.test/v1"
         assert rows[0]["api_call_count"] == 1
 
-    def test_validate_llm_response_records_recovered_response_once(self, db):
+    @pytest.mark.parametrize("response_type", [dict, SimpleNamespace])
+    def test_validate_llm_response_records_recovered_response_once(self, db, response_type):
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
         )
         from agent.auxiliary_client import _validate_llm_response
 
-        response = {
+        response = response_type(**{
+            "id": "recovered-id",
             "model": "recovered-model",
+            "finish_reason": "length",
             "output_text": "Recovered content",
             "usage": SimpleNamespace(
                 prompt_tokens=8,
                 completion_tokens=3,
                 total_tokens=11,
             ),
-        }
+        })
         db.create_session("s1", source="cli")
         token = set_accounting_context(db, "s1")
         try:
@@ -266,6 +269,8 @@ class TestAmbientAccountingContext:
             reset_accounting_context(token)
 
         assert out.choices[0].message.content == "Recovered content"
+        assert out.choices[0].finish_reason == "length"
+        assert out.id == "recovered-id"
         rows = _usage_rows(db, "s1")
         assert len(rows) == 1
         assert rows[0]["task"] == "vision"
@@ -304,11 +309,7 @@ class TestAmbientAccountingContext:
 
 class TestAnalyticsAuxRows:
     def test_aux_usage_rows_and_merge(self, db):
-        from hermes_cli.web_server import (
-            _aux_task_summary,
-            _aux_usage_rows,
-            _merge_aux_into_by_model,
-        )
+        from hermes_cli.web_server_profiles import _aux_task_summary, _aux_usage_rows, _merge_aux_into_by_model
 
         db.create_session("s1", source="cli")
         db.update_token_counts(

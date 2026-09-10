@@ -550,6 +550,60 @@ class TestPreprocessImagesWithVision:
         assert len(outer_rows) == 1
         assert dict(outer_rows[0])["task"] == "web_extract"
 
+    @pytest.mark.parametrize("case", ["missing-image", "missing-handles", "vision-error", "path-error"])
+    def test_vision_preprocessing_restores_context_on_other_exits(self, cli, tmp_path, case):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("outer-session", source="cli")
+        db.create_session("vision-session", source="cli")
+        if case != "missing-handles":
+            cli._session_db = db
+            cli.session_id = "vision-session"
+        response = SimpleNamespace(
+            model="vision-model",
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+
+        async def _fake_vision(**kwargs):
+            if case == "vision-error":
+                raise RuntimeError("vision unavailable")
+            record_aux_usage(response, "vision")
+            return '{"success": true, "analysis": "Accounted image"}'
+
+        img = self._make_image(tmp_path)
+        if case == "missing-image":
+            img = tmp_path / "missing.png"
+        elif case == "path-error":
+            img = MagicMock(spec=Path)
+            img.exists.return_value = True
+            img.stat.side_effect = OSError("image unavailable")
+        outer_token = set_accounting_context(db, "outer-session")
+        try:
+            with patch("tools.vision_tools.vision_analyze_tool", side_effect=_fake_vision) as vision:
+                if case == "path-error":
+                    with pytest.raises(OSError, match="image unavailable"):
+                        cli._preprocess_images_with_vision("Describe this", [img], announce=False)
+                else:
+                    result = cli._preprocess_images_with_vision("Describe this", [img], announce=False)
+                    assert "Describe this" in result
+                assert vision.call_count == (case in {"missing-handles", "vision-error"})
+            record_aux_usage(response, "web_extract", provider="outer-provider")
+            with db._lock:
+                rows = db._conn.execute("SELECT * FROM session_model_usage").fetchall()
+            assert len(rows) == 1
+            assert dict(rows[0])["session_id"] == "outer-session"
+            assert dict(rows[0])["task"] == "web_extract"
+            assert dict(rows[0])["api_call_count"] == 1
+        finally:
+            reset_accounting_context(outer_token)
+            db.close()
+
 
 # ═════════════════════════════════════════════════════════════════════════
 # Level 3: _try_attach_clipboard_image — state management
