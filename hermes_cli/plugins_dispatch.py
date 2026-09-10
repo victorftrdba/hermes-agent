@@ -15,7 +15,7 @@ import re
 import threading
 import time
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
@@ -138,6 +138,14 @@ class _QueuedPluginEvent:
 _HOOK_CALLBACK_TIMEOUT_SECS = 30.0
 _MAX_HOOK_CALLBACK_TIMEOUT_SECS = 600.0
 _HOOK_SKIPPED = object()  # returned by _run_hook_callback_bounded on skip/timeout
+_HOOK_ACTIVE_CALLBACKS = contextvars.ContextVar("hermes_active_hook_callbacks", default=frozenset())
+
+
+@dataclass
+class _HookCallbackState:
+    active: Optional[object] = None
+    timed_out: bool = False
+    waiters: list[tuple[object, threading.Event]] = field(default_factory=list)
 
 
 def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
@@ -201,45 +209,85 @@ class PluginDispatchMixin:
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: Dict[str, Any], timeout: float
     ) -> Any:
-        """Run one callback on a daemon worker with a wall-clock cap; ``_HOOK_SKIPPED`` when
-        suppressed, still running, timed out (worker abandoned, never joined), or the worker
-        could not be started. Exceptions propagate."""
+        """Serialize healthy callbacks within one queue-plus-runtime deadline, without joining
+        abandoned workers. Reentrant, suppressed, or expired calls return ``_HOOK_SKIPPED``."""
+        deadline = time.monotonic() + timeout
         callback_name = getattr(cb, "__name__", repr(cb))
         callback_key = (hook_name, id(cb))
+        context_key = (id(self), *callback_key)
+        active_context = _HOOK_ACTIVE_CALLBACKS.get()
+        if context_key in active_context:
+            return _HOOK_SKIPPED
         token = object()
+        ready = threading.Event()
+        waiter = (token, ready)
         with self._hook_timeout_lock:
             suppressed_until = self._hook_timeout_suppressed_until.get(callback_key)
-            running = callback_key in self._hook_running_callbacks
-            if (suppressed_until is not None and suppressed_until > time.monotonic()) or running:
+            state = self._hook_running_callbacks.get(callback_key)
+            if (suppressed_until is not None and suppressed_until > time.monotonic()) or (state and state.timed_out):
                 logger.warning(
                     "Hook '%s' callback %s skipped after previous "
-                    "timeout or while still running", hook_name, callback_name)
+                    "timeout", hook_name, callback_name)
                 return _HOOK_SKIPPED
             if suppressed_until is not None:
                 self._hook_timeout_suppressed_until.pop(callback_key, None)
-            self._hook_running_callbacks[callback_key] = token
+            if state is None:
+                state = _HookCallbackState()
+                self._hook_running_callbacks[callback_key] = state
+            state.waiters.append(waiter)
+
+        while True:
+            with self._hook_timeout_lock:
+                remaining = deadline - time.monotonic()
+                current = self._hook_running_callbacks.get(callback_key) is state
+                if not current or state.timed_out or remaining <= 0:
+                    state.waiters.remove(waiter)
+                    if current and state.active is None:
+                        if state.waiters:
+                            state.waiters[0][1].set()
+                        else:
+                            self._hook_running_callbacks.pop(callback_key, None)
+                    return _HOOK_SKIPPED
+                if state.active is None and state.waiters[0] is waiter:
+                    state.waiters.pop(0)
+                    state.active = token
+                    break
+            ready.wait(timeout=remaining)
 
         context = contextvars.copy_context()
+        context.run(_HOOK_ACTIVE_CALLBACKS.set, active_context | {context_key})
         done = threading.Event()
         outcome: Dict[str, Any] = {}
         failure: Dict[str, Exception] = {}
 
         def _release_token() -> None:
             with self._hook_timeout_lock:
-                if self._hook_running_callbacks.get(callback_key) is token:
-                    self._hook_running_callbacks.pop(callback_key, None)
+                done.set()
+                if self._hook_running_callbacks.get(callback_key) is state and state.active is token:
+                    state.active = None
+                    if state.waiters and not state.timed_out:
+                        state.waiters[0][1].set()
+                    else:
+                        self._hook_running_callbacks.pop(callback_key, None)
+                else:
+                    for _, event in state.waiters:
+                        event.set()
 
         def _runner() -> None:
             try:
+                with self._hook_timeout_lock:
+                    if (time.monotonic() >= deadline or state.timed_out
+                            or self._hook_running_callbacks.get(callback_key) is not state or state.active is not token):
+                        outcome["value"] = _HOOK_SKIPPED
+                        return
                 outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
             except Exception as exc:
                 failure["exc"] = exc
             finally:
                 _release_token()
-                done.set()
 
-        thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
         try:
+            thread = threading.Thread(target=_runner, name=f"hermes-hook-{callback_name}"[:40], daemon=True)
             thread.start()
         except RuntimeError as exc:
             _release_token()  # the runner's finally never runs when OS thread creation fails
@@ -247,14 +295,18 @@ class PluginDispatchMixin:
                 "Hook '%s' callback %s worker failed to start: %s — skipping",
                 hook_name, callback_name, exc)
             return _HOOK_SKIPPED
-        if not done.wait(timeout=timeout):  # do not join — that would reintroduce the hang
+        if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
             with self._hook_timeout_lock:
-                # See #6622.
-                self._hook_timeout_suppressed_until[callback_key] = (
-                    time.monotonic() + self._hook_timeout_suppression_seconds)
-            logger.warning(
-                "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
-            return _HOOK_SKIPPED
+                if not done.is_set():
+                    if self._hook_running_callbacks.get(callback_key) is state and state.active is token:
+                        state.timed_out = True
+                        self._hook_timeout_suppressed_until[callback_key] = (
+                            time.monotonic() + self._hook_timeout_suppression_seconds)
+                        for _, event in state.waiters:
+                            event.set()
+                    logger.warning(
+                        "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+                    return _HOOK_SKIPPED
         if "exc" in failure:
             raise failure["exc"]
         return outcome.get("value")

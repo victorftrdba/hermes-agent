@@ -55,7 +55,7 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
     _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
-    is_valid_system_prompt_section_id,
+    is_valid_system_prompt_section_id, _HookCallbackState,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
 from hermes_cli.plugins_state import (
@@ -1153,7 +1153,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._emit_depth = threading.local()
         # In-flight / recently-timed-out hook callbacks keyed by (hook_name, id(cb)) so a stuck
         # policy hook cannot spawn a new abandoned thread on every fire.
-        self._hook_running_callbacks: Dict[tuple, object] = {}
+        self._hook_running_callbacks: Dict[tuple, _HookCallbackState] = {}
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
@@ -1672,8 +1672,9 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
     bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
-    fail closed with a block directive; other bounded hooks fail open (skip).
+    joined) so we do not reintroduce the #6622 hang. Healthy concurrent callbacks wait FIFO within that
+    same deadline. Timed-out or reentrant ``pre_tool_call`` callbacks fail closed with a block directive;
+    other bounded hooks fail open (skip).
     Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
     callbacks registered by user plugins (tracking #64178).
