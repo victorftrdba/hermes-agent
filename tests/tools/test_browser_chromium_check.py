@@ -38,6 +38,31 @@ class TestChromiumSearchRoots:
 
 
 class TestChromiumInstalled:
+    @pytest.mark.parametrize("platform,relative", [
+        pytest.param("darwin", "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing", id="darwin-direct"),
+        pytest.param("darwin", "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing", id="darwin-arm64"),
+        pytest.param("darwin", "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing", id="darwin-x64"),
+        pytest.param("linux", "chrome", id="linux-direct"),
+        pytest.param("linux", "chrome-linux64/chrome", id="linux-nested"),
+        pytest.param("win32", "chrome.exe", id="windows-direct"),
+        pytest.param("win32", "chrome-win64/chrome.exe", id="windows-nested"),
+    ])
+    @pytest.mark.parametrize("complete", [False, True], ids=["partial", "complete"])
+    def test_agent_browser_cache_requires_browser_file(self, monkeypatch, tmp_path, platform, relative, complete):
+        monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
+        monkeypatch.setattr(bt_install.sys, "platform", platform)
+        monkeypatch.setattr(os.path, "expanduser", lambda path: str(tmp_path))
+        monkeypatch.setattr(shutil, "which", lambda *args, **kwargs: None)
+        monkeypatch.setattr(bt_install, "_chromium_search_roots", lambda: [])
+        executable = tmp_path / ".agent-browser" / "browsers" / "chrome-153.0.0" / relative
+        executable.parent.mkdir(parents=True)
+        if complete:
+            executable.write_text("browser fixture")
+        else:
+            executable.mkdir()
+
+        assert bt_install._chromium_installed() is complete
+
     def test_true_when_plain_chromium_on_path(self, monkeypatch):
         monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
         monkeypatch.setattr(
