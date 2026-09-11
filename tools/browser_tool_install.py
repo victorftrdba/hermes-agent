@@ -224,10 +224,30 @@ def _has_chromium_build(root: str) -> bool:
         return False
 
 
+def _has_agent_browser_chromium() -> bool:
+    """Check agent-browser's Chrome for Testing cache for a platform browser file."""
+    root = os.path.join(os.path.expanduser("~"), ".agent-browser", "browsers")
+    mac = "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+    relative_paths = {
+        "darwin": (mac, f"chrome-mac-arm64/{mac}", f"chrome-mac-x64/{mac}"),
+        "linux": ("chrome", "chrome-linux64/chrome"),
+        "win32": ("chrome.exe", "chrome-win64/chrome.exe"),
+    }.get(sys.platform, ())
+    try:
+        return any(
+            entry.startswith("chrome-") and any(
+                os.path.isfile(os.path.join(root, entry, relative)) for relative in relative_paths
+            )
+            for entry in os.listdir(root)
+        )
+    except OSError:
+        return False
+
+
 def _chromium_installed() -> bool:
     """True when a usable Chromium (or headless-shell) build is on disk; cached.
 
-    Checks ``AGENT_BROWSER_EXECUTABLE_PATH``, then system Chrome/Chromium on PATH, then Playwright's cache.
+    Checks ``AGENT_BROWSER_EXECUTABLE_PATH``, system Chrome/Chromium on PATH, and Playwright/agent-browser caches.
     Without a binary the CLI hangs on first use until the command timeout fires, so the tool must not be advertised.
     """
     _bt = _origin()
@@ -238,6 +258,7 @@ def _chromium_installed() -> bool:
         (ab_path and (os.path.isfile(ab_path) or shutil.which(ab_path)))
         or any(shutil.which(name) for name in ("google-chrome", "chromium", "chromium-browser", "chrome"))
         or any(root and os.path.isdir(root) and _has_chromium_build(root) for root in _chromium_search_roots())
+        or _has_agent_browser_chromium()
     )
     return _bt._cached_chromium_installed
 

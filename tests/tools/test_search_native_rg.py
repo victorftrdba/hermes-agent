@@ -105,6 +105,48 @@ def test_native_runner_honours_deadline_and_interrupt_while_rg_is_silent(tree, o
     assert result.exit_code == 130 and time.monotonic() - started < 5
 
 
+def test_native_runner_preserves_output_if_process_exits_before_cleanup(tree, ops_factory, monkeypatch):
+    import io
+    import signal
+    from types import SimpleNamespace
+
+    import psutil
+
+    import tools.environments.local as local
+    import tools.file_operations_search as search
+
+    ops = ops_factory(tree, [])
+    proc = SimpleNamespace(
+        pid=12345,
+        stdout=io.BytesIO(b"needle one\n"),
+        returncode=0,
+        poll=lambda: None,
+        wait=lambda: 0,
+    )
+    cleanup_calls = []
+
+    def exited_getpgid(pid):
+        assert pid == proc.pid
+        raise ProcessLookupError
+
+    def killpg(pgid, sig):
+        cleanup_calls.append((pgid, sig))
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(search.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(local.os, "getpgid", exited_getpgid)
+    monkeypatch.setattr(local.os, "killpg", killpg)
+    monkeypatch.setattr(psutil, "Process", lambda pid: SimpleNamespace(children=lambda recursive: []))
+
+    result = ops._run_rg_native(["rg", "needle", str(tree)], 50, timeout=5)
+
+    assert result.exit_code == 0
+    assert result.stdout == "needle one\n"
+    assert proc.stdout.closed
+    assert cleanup_calls == [(proc.pid, signal.SIGTERM), (proc.pid, 0)]
+
+
 def test_kill_switch_routes_search_back_to_the_shell(tree, ops_factory, monkeypatch):
     monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "0")
     calls = []
