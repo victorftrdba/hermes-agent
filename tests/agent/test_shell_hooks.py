@@ -32,11 +32,38 @@ def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
 
 
 @pytest.mark.parametrize("event,closed,code,stdout,blocked", [
+    # fail-closed pre_tool_call: a nonzero exit is authoritative — no allow/modify escapes
     ("pre_tool_call", True, 1, "", True),
     ("pre_tool_call", True, 1, "  ", True),
+    ("pre_tool_call", True, 1, "{}", True),
+    ("pre_tool_call", True, 1, '{"action": "allow"}', True),
+    ("pre_tool_call", True, 1, '{"action": "modify", "args": {"path": "/safe"}}', True),
+    ("pre_tool_call", True, 1, '{"decision": "block", "reason": "explicit block"}', True),
+    ("pre_tool_call", True, 2, '{"action": "allow"}', True),  # exit 2 blocks regardless of stdout
+    # clean controls: exit 0 keeps the existing fail-closed semantics
     ("pre_tool_call", True, 0, "", False),
     ("pre_tool_call", True, 0, "{}", False),
+    ("pre_tool_call", True, 0, '{"context": "note"}', False),
+    ("pre_tool_call", True, 0, '{"action": "allow"}', False),
+    ("pre_tool_call", True, 0, '{"action": "modify", "args": {"path": "/safe"}}', False),
+    ("pre_tool_call", True, 0, '{"decision": "modify", "tool_input": {"content": "safe"}}', False),
+    # malformed explicit directives on a successful fail-closed hook fail closed
+    ("pre_tool_call", True, 0, '{"action": "bogus"}', True),
+    ("pre_tool_call", True, 0, '{"decision": "unknown"}', True),
+    ("pre_tool_call", True, 0, '{"action": "modify"}', True),
+    ("pre_tool_call", True, 0, '{"action": "modify", "args": "not-a-dict"}', True),
+    ("pre_tool_call", True, 0, '{"decision": "modify", "tool_input": 5}', True),
+    ("pre_tool_call", True, 0, '{"action": null}', True),
+    ("pre_tool_call", True, 0, '{"action": ["block"]}', True),
+    ("pre_tool_call", True, 0, '{"action": {"block": true}}', True),
+    ("pre_tool_call", True, 0, '{"action": "bogus", "decision": "modify", "tool_input": {"content": "safe"}}', True),
+    ("pre_tool_call", True, 0, '{"action": "bogus", "decision": "block", "reason": "explicit"}', True),
+    # default-open controls: fail-open hooks keep parsing stdout
     ("pre_tool_call", False, 1, "", False),
+    ("pre_tool_call", False, 1, '{"action": "allow"}', False),
+    ("pre_tool_call", False, 1, '{"action": "modify", "args": {"path": "/safe"}}', False),
+    ("pre_tool_call", False, 1, '{"action": "bogus"}', False),
+    ("pre_tool_call", False, 0, '{"action": "bogus"}', False),
     ("post_tool_call", True, 1, "", False),
 ])
 def test_empty_exit_policy_through_real_hook(tmp_path, monkeypatch, event, closed, code, stdout, blocked):
@@ -760,3 +787,70 @@ class TestFailSemanticsEndToEnd:
         assert result["timed_out"] is True
         assert result["parsed"]["action"] == "block"
         assert "failed closed" in result["parsed"]["message"]
+
+
+# ── Native dispatch boundary (criterion 4) ────────────────────────────────
+
+
+class TestNativeDispatchBoundary:
+    """A registered fail-closed hook gates the native dispatch boundary
+    (model_tools._pre_dispatch_guards): blocked results never reach the
+    sentinel dispatch, valid ones do — harmless read_file input only."""
+
+    @pytest.mark.parametrize("stdout,code,outcome,expected_args", [
+        # fail-closed nonzero exit: authoritative block, no allow/modify escapes
+        ("{}", 1, "blocked", None),
+        ('{"action": "allow"}', 1, "blocked", None),
+        ('{"action": "modify", "args": {"path": "/safe.txt"}}', 1, "blocked", None),
+        ('{"decision": "block", "reason": "policy denial"}', 1, "blocked", None),
+        # successful fail-closed hook: dispatch proceeds (modify merges its args)
+        ("{}", 0, "dispatched", {"path": "fixture.txt"}),
+        ('{"action": "allow"}', 0, "dispatched", {"path": "fixture.txt"}),
+        ('{"action": "modify", "args": {"path": "/safe.txt"}}', 0, "dispatched", {"path": "/safe.txt"}),
+        # malformed explicit directives on a successful fail-closed hook block at the boundary
+        ('{"action": null}', 0, "blocked", None),
+        ('{"action": ["block"]}', 0, "blocked", None),
+        ('{"action": {"block": true}}', 0, "blocked", None),
+        ('{"action": "bogus"}', 0, "blocked", None),
+        ('{"action": "bogus", "decision": "modify", "tool_input": {"content": "safe"}}', 0, "blocked", None),
+    ])
+    def test_registered_hook_gates_native_dispatch(
+        self, tmp_path, monkeypatch, stdout, code, outcome, expected_args,
+    ):
+        import shlex
+        import sys
+
+        from hermes_cli import plugins
+        from model_tools import _CallIds, _pre_dispatch_guards
+
+        script = _write_script(
+            tmp_path, "gate.py",
+            f"import sys\nsys.stdout.write({stdout!r})\nsys.exit({code})\n",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+        monkeypatch.setattr(plugins, "_plugin_manager", plugins.PluginManager())
+
+        registered = shell_hooks.register_from_config(
+            {"hooks": {"pre_tool_call": [
+                {"matcher": "read_file", "command": shlex.join([sys.executable, str(script)]),
+                 "fail_closed": True},
+            ]}},
+            accept_hooks=True,
+        )
+        assert len(registered) == 1
+
+        dispatched: list = []
+        args, block = _pre_dispatch_guards(
+            "read_file", {"path": "fixture.txt"}, False, _CallIds(), [],
+        )
+        if block is None:
+            dispatched.append(args)  # the sentinel dispatch
+        assert (not dispatched) is (outcome == "blocked")
+        if outcome == "blocked":
+            assert block is not None and block[1] == "plugin_block"
+            if '{"decision": "block"' in stdout:
+                assert block[2] == "policy denial"
+        else:
+            assert block is None
+            assert dispatched == [expected_args]

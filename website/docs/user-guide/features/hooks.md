@@ -1702,7 +1702,11 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 | Command not found / not executable | warn, proceed | **block** |
 | Timeout | warn, proceed | **block** |
 | Non-JSON stdout (e.g. a stack trace) | warn, proceed | **block** |
+| Non-zero exit with no-op, allow, or modify JSON | parse stdout | **block** |
+| Clean exit with an invalid explicit action/decision or modify payload | ignore invalid directive | **block** |
 | Clean exit, valid no-op JSON (`{}`) | proceed | proceed |
+
+For a fail-closed gate, the process exit status is authoritative: printing valid JSON cannot turn a failed hook into permission to execute. An explicit block retains its reason and takes precedence over other directives. Each explicitly supplied `action` or `decision` must be a supported string (`allow`, `block`, or `modify`), and `modify` requires an object in its corresponding `args` or `tool_input` field. A malformed sibling directive cannot be hidden by a valid modify directive. Empty output, metadata-only objects, explicit allow, and valid modify remain supported on a clean exit.
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
 

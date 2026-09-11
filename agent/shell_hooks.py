@@ -341,8 +341,9 @@ def _fail_closed_block(spec: ShellHookSpec, reason: str) -> Dict[str, Any]:
 def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """``_spawn`` result → hook contribution (live callback and ``run_once``). Spawn error/timeout fail
     open unless fail_closed; exit 2 on a blocking event blocks (message: stdout JSON, then stderr, then
-    default); other non-zero exits warn then parse stdout; empty failed output and unparseable stdout
-    on a fail_closed hook block."""
+    default); on a fail_closed blocking hook any other non-zero exit blocks too (an explicit stdout
+    block reason is preserved); a malformed explicit directive on a successful fail_closed hook blocks;
+    empty output, ``{}``, metadata-only, allow and valid modify stay compatible."""
     blocking_event = spec.event in _BLOCKING_EVENTS
     fail_closed = spec.fail_closed and blocking_event
     if r["error"]:
@@ -366,12 +367,19 @@ def _evaluate_result(spec: ShellHookSpec, r: Dict[str, Any]) -> Optional[Dict[st
         logger.warning("shell hook exited %d (event=%s command=%s); stderr=%s",
                        r["returncode"], spec.event, spec.command, stderr[:_STDERR_MESSAGE_LIMIT])
     stdout = (r["stdout"] or "").strip()
-    if fail_closed and r["returncode"] != 0 and not stdout:
-        return _fail_closed_block(spec, f"exited {r['returncode']} without a directive")
     parsed = _parse_response(spec.event, stdout)
-    if parsed is None and fail_closed and stdout and not _is_json_object(stdout):
-        # A fail-closed gate must not silently allow on garbage stdout (e.g. a stack trace).
-        return _fail_closed_block(spec, "unparseable stdout (expected a JSON object)")
+    if isinstance(parsed, dict) and parsed.get("action") == "block":
+        return parsed
+    if fail_closed and r["returncode"] != 0:
+        # A failed blocking hook cannot authorize or modify: the nonzero exit is authoritative
+        # even when stdout carried an allow, modify or clean no-op directive.
+        return _fail_closed_block(spec, f"exited {r['returncode']} without a block directive")
+    if fail_closed and stdout:
+        if not _is_json_object(stdout):
+            # A fail-closed gate must not silently allow on garbage stdout (e.g. a stack trace).
+            return _fail_closed_block(spec, "unparseable stdout (expected a JSON object)")
+        if _has_malformed_pre_tool_directive(json.loads(stdout)):
+            return _fail_closed_block(spec, "malformed explicit directive in stdout")
     return parsed
 
 
@@ -406,6 +414,27 @@ def _parse_pre_tool_call(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if data.get(verb) == "modify" and isinstance(data.get(payload), dict):
             return {"action": "modify", "args": data[payload]}
     return None
+
+
+# Recognized pre_tool_call directive verbs (block/modify are handled by _parse_pre_tool_call;
+# allow is the explicit no-op whose compatibility fail_closed must preserve).
+_PRE_TOOL_VERBS = frozenset({"block", "modify", "allow"})
+
+
+def _has_malformed_pre_tool_directive(data: Dict[str, Any]) -> bool:
+    """True when a pre_tool_call object speaks the directive dialect with an unsupported verb or
+    a modify without dict args — a fail-closed gate must not treat it as a clean no-op."""
+    for verb, _, _, payload in _PRE_TOOL_DIALECTS:
+        if verb not in data:
+            continue
+        value = data[verb]
+        if not isinstance(value, str):
+            return True
+        if value not in _PRE_TOOL_VERBS:
+            return True
+        if value == "modify" and not isinstance(data.get(payload), dict):
+            return True
+    return False
 
 
 def _parse_pre_verify(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
