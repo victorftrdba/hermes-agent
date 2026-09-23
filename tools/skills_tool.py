@@ -29,10 +29,11 @@ from tools.skills_tool_dedup import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Per-session discovery cache: {cache_key: (signature, timestamp, skills_list)}. Signature =
-# per-dir max mtime of the dir and its immediate children (add/remove inside a category does
-# NOT bump the root mtime) + the disabled set (config-only change, no mtime) + platform; the
-# TTL bounds staleness from in-place SKILL.md edits, which no directory signature can see.
+# Per-session discovery cache: {cache_key: (signature, timestamp, skills_list, path_index)}.
+# Signature = per-dir max mtime of the dir and its immediate children (add/remove inside a
+# category does NOT bump the root mtime) + the disabled set (config-only change, no mtime) +
+# platform; the TTL bounds staleness from in-place SKILL.md edits, which no directory signature
+# can see. The path index is ((scan_dir, (SKILL.md, ...)), ...) in scan precedence order.
 _SKILLS_CACHE: dict = {}
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 
@@ -187,7 +188,7 @@ def _skill_search_dirs() -> Tuple[list, list, Path]:
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """All skills (name, description, category) across project/local/external dirs, first-wins
     by name; cached per session. ``skip_disabled=True`` ignores disabled state (config UI)."""
-    from agent.skill_utils import iter_project_skill_files, iter_skill_index_files
+    from agent.skill_utils import is_quarantined_project_skill, iter_skill_index_files
     cache_key = "with_disabled" if skip_disabled else "filtered"
     disabled = set() if skip_disabled else _get_disabled_skill_names()
     project_dirs, dirs_to_scan, _ = _skill_search_dirs()
@@ -199,10 +200,14 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # s["enabled"]/s["usage"]); handing out cached objects would poison the cache.
         return [dict(s) for s in cached[2]]
     skills = []
+    path_index = []
     seen_names: set = set()
     for scan_dir in dirs_to_scan:  # project dirs go through the quarantine chokepoint
-        _iter = iter_project_skill_files if scan_dir in project_dirs else lambda d: iter_skill_index_files(d, "SKILL.md")
-        for skill_md in _iter(scan_dir):
+        skill_paths = tuple(iter_skill_index_files(scan_dir, "SKILL.md"))
+        path_index.append((scan_dir, skill_paths))
+        for skill_md in skill_paths:
+            if scan_dir in project_dirs and is_quarantined_project_skill(skill_md):
+                continue
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
@@ -225,7 +230,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 logger.debug("Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True)
     # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the
     # signature, so the next call re-scans instead of serving a torn result.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    _SKILLS_CACHE[cache_key] = (signature, now, skills, tuple(path_index))
     return [dict(s) for s in skills]
 
 
@@ -321,9 +326,11 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
     Collision detection is the point: silent shadowing of a local skill by a same-named
     external one is a real bug class, so the caller refuses >1."""
-    from agent.skill_utils import iter_skill_index_files
     candidates: List[Tuple[Optional[Path], Path]] = []
     seen_md: set = set()
+    _find_all_skills()
+    cached_path_index = _SKILLS_CACHE["filtered"][3]
+    paths_by_dir = {scan_dir: paths for scan_dir, paths in cached_path_index}
 
     def _record(sd: Optional[Path], smd: Path) -> None:
         key = smd
@@ -345,8 +352,9 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
             _record_direct(search_dir / direct)
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
-        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-            if (found_skill_md.parent.name == name
+        for found_skill_md in paths_by_dir.get(search_dir, ()):
+            if found_skill_md.exists() and (
+                    found_skill_md.parent.name == name
                     or _safe_frontmatter(found_skill_md).get("name") == name):
                 _record(found_skill_md.parent, found_skill_md)
         # Legacy flat <name>.md anywhere under the dir; support docs are excluded
