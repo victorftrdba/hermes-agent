@@ -85,7 +85,7 @@ def make_startup_runner(tmp_path):
 
     runner.hooks = MagicMock()
     runner.hooks.loaded_hooks = []
-    runner.hooks.discover_and_load = MagicMock()
+    runner.hooks.discover_and_load = AsyncMock()
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
     runner.session_store.suspend_recently_active.return_value = 0

@@ -73,8 +73,11 @@ class HookRegistry:
     def _register_builtin_hooks(self) -> None:
         """Extension point for always-on built-in hooks; currently none shipped."""
 
-    def discover_and_load(self) -> None:
-        """Register built-in hooks, then load every valid hook dir under HOOKS_DIR."""
+    async def discover_and_load(self) -> None:
+        """Register built-in hooks, then load every valid hook dir under HOOKS_DIR off the loop."""
+        await asyncio.to_thread(self._discover_and_load_sync)
+
+    def _discover_and_load_sync(self) -> None:
         self._register_builtin_hooks()
         if not HOOKS_DIR.exists():
             return
@@ -110,13 +113,14 @@ class HookRegistry:
 
     async def emit_collect(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> List[Any]:
         """Fire handlers and return their non-None return values in order (decision-style
-        hooks, e.g. ``command:<name>`` policies).  A failing handler is logged, not fatal."""
+        hooks, e.g. ``command:<name>`` policies).  Sync handlers run off the event-loop
+        thread; async handlers stay on it.  A failing handler is logged, not fatal."""
         if context is None:
             context = {}
         results: List[Any] = []
         for fn in self._resolve_handlers(event_type):
             try:
-                result = fn(event_type, context)
+                result = await asyncio.to_thread(fn, event_type, context)
                 result = await result if asyncio.iscoroutine(result) else result  # sync or async handlers
                 if result is not None:
                     results.append(result)
