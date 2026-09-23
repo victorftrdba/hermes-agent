@@ -92,6 +92,7 @@ class TestStartupPlatformIsolation:
         )
         runner.hooks = MagicMock()
         runner.hooks.loaded_hooks = []
+        runner.hooks.discover_and_load = AsyncMock()
         runner.hooks.emit = AsyncMock()
         runner._suspend_stuck_loop_sessions = MagicMock(return_value=0)
         runner._update_runtime_status = MagicMock()
@@ -915,6 +916,7 @@ class TestVoiceInputCallbackWiring:
         runner._suspend_stuck_loop_sessions = MagicMock(return_value=0)
         runner.hooks = MagicMock()
         runner.hooks.loaded_hooks = []
+        runner.hooks.discover_and_load = AsyncMock()
         runner.hooks.emit = AsyncMock()
         return runner
 
