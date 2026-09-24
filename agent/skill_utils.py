@@ -738,11 +738,14 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     EXCLUDED_SKILL_DIRS and support dirs of skill roots. Org mirrors are
     TOKEN-GATED: only the active org's subdir is walked, so leaving an org
     stops its skills resolving without manual cleanup."""
+    from tools.interrupt import is_interrupted
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        if is_interrupted():
+            raise InterruptedError("User sent a new message")
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -751,7 +754,10 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))
-    yield from map(Path, sorted(matches))
+    for match in sorted(matches):
+        if is_interrupted():
+            raise InterruptedError("User sent a new message")
+        yield Path(match)
 
 
 # Namespace helpers for plugin-provided skills.

@@ -198,6 +198,33 @@ def test_iter_skill_index_files_keeps_support_named_categories(tmp_path):
     assert is_excluded_skill_path(scripts_skill / "SKILL.md") is False
 
 
+def test_iter_skill_index_files_interrupts_during_traversal(tmp_path):
+    walked = [
+        (str(tmp_path / "first"), [], ["SKILL.md"]),
+        (str(tmp_path / "second"), [], ["SKILL.md"]),
+    ]
+    found = []
+    with (
+        patch("agent.skill_utils.os.walk", return_value=iter(walked)),
+        patch("tools.interrupt.is_interrupted", side_effect=[False, True]),
+        pytest.raises(InterruptedError, match="User sent a new message"),
+    ):
+        found.extend(iter_skill_index_files(tmp_path, "SKILL.md"))
+    assert found == []
+
+
+def test_iter_skill_index_files_interrupts_before_yield(tmp_path):
+    walked = [(str(tmp_path / "skill"), [], ["SKILL.md"])]
+    found = []
+    with (
+        patch("agent.skill_utils.os.walk", return_value=iter(walked)),
+        patch("tools.interrupt.is_interrupted", side_effect=[False, True]),
+        pytest.raises(InterruptedError, match="User sent a new message"),
+    ):
+        found.extend(iter_skill_index_files(tmp_path, "SKILL.md"))
+    assert found == []
+
+
 def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monkeypatch):
     discovery_root = tmp_path / "site-packages" / "skills"
     umbrella = discovery_root / "category" / "umbrella"
@@ -381,4 +408,3 @@ class TestBOMToleranceSiblingSites:
         fm = _split_frontmatter("\ufeff---\nname: bp\n---\nbody")
         assert fm is not None
         assert fm.get("name") == "bp"
-
