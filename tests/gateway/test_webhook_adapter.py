@@ -963,6 +963,59 @@ class TestDualStackBind:
             await adapter.disconnect()
 
 
+class TestConnectCancellation:
+    """A connect() cancelled after the real TCP bind must release the listener.
+
+    Regression guard: the caller's connect timeout cancels the connect task;
+    CancelledError used to propagate without runner cleanup, leaving the port
+    bound with no owner, so the next connect attempt failed on bind forever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_connect_releases_listener_for_rebind(self):
+        """Pause inside site.start() (after the real bind), cancel, then rebind.
+
+        The patched start performs the real bind before blocking, making the
+        cancellation deterministic. Without cleanup the port stays held and the
+        replacement adapter's connect() takes the OSError path; a released port
+        lets the replacement bind and return True.
+        """
+        routes = {"r1": {"secret": "real-secret-abc123", "prompt": "x"}}
+        adapter = _make_adapter(routes=routes, host="127.0.0.1", port=0)
+        replacement = None
+        listener_bound = asyncio.Event()
+        resume = asyncio.Event()
+        bound_port: list[int] = []
+        real_start = web.TCPSite.start
+
+        async def _start_then_pause(site):
+            await real_start(site)
+            bound_port.append(site._server.sockets[0].getsockname()[1])
+            listener_bound.set()
+            await resume.wait()
+
+        try:
+            with patch.object(adapter, "_reload_dynamic_routes"), \
+                    patch.object(web.TCPSite, "start", _start_then_pause):
+                pending = asyncio.create_task(adapter.connect())
+                await asyncio.wait_for(listener_bound.wait(), timeout=10)
+                pending.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+            assert adapter._runner is None
+            assert bound_port, "listener never bound"
+            port = bound_port[0]
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            replacement = _make_adapter(routes=routes, host="127.0.0.1", port=port)
+            with patch.object(replacement, "_reload_dynamic_routes"):
+                assert await replacement.connect() is True
+        finally:
+            await adapter.disconnect()
+            if replacement is not None:
+                await replacement.disconnect()
+
+
 # Regression coverage for #72041: profile-bound webhook authentication
 class TestMultiplexProfileWebhookAuthentication:
     @staticmethod
