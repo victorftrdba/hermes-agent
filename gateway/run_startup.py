@@ -906,7 +906,7 @@ class GatewayStartupMixin:
         """Plugins, relay, hooks, then crash/clean-exit recovery of processes and sessions."""
         from gateway.run import _hermes_home
         self._start_register_plugins_relay_hooks()
-        self.hooks.discover_and_load()
+        await self.hooks.discover_and_load()
         # Recover background processes from checkpoint (crash recovery)
         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
             from tools.process_registry import process_registry
