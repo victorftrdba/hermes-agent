@@ -51,6 +51,7 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._agent_session_db_available = False
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -1014,7 +1015,8 @@ class TurnRunner:
         ctx = self._ctx
         runner = self._runner
         src = ctx.source
-        return ctx.AIAgent(
+        session_db = runner._session_db
+        agent = ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=True, verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
@@ -1029,7 +1031,7 @@ class TurnRunner:
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
             gateway_session_key=ctx.session_key,
-            session_db=getattr(runner._session_db, "_db", runner._session_db),
+            session_db=getattr(session_db, "_db", session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
             fallback_model=self._runner._refresh_fallback_model(),
@@ -1037,6 +1039,8 @@ class TurnRunner:
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
         )
+        agent._gateway_constructed_with_session_db = session_db is not None
+        return agent
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
         """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache
@@ -1075,6 +1079,12 @@ class TurnRunner:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        self._agent_session_db_available = bool(
+            getattr(
+                agent, "_gateway_constructed_with_session_db",
+                getattr(agent, "_session_db", None) is not None,
+            )
+        )
         return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────
@@ -1545,6 +1555,8 @@ class TurnRunner:
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
         ctx = self._ctx
+        if isinstance(result, dict):
+            result["agent_session_db_available"] = self._agent_session_db_available
         # Canonicalize a model-emitted computer-use screenshot path at the common result boundary so
         # the streaming finalizer and the non-streaming delivery path see the same response.
         if isinstance(result, dict) and isinstance(result.get("final_response"), str):
@@ -1726,7 +1738,11 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+            return {
+                "final_response": f"⚠️ Provider authentication failed: {exc}",
+                "messages": [], "api_calls": 0, "tools": [],
+                "agent_session_db_available": False,
+            }
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
@@ -1771,6 +1787,7 @@ class TurnRunner:
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
+            "agent_session_db_available": self._agent_session_db_available,
             **usage,
         }
         if not final_response:
@@ -1789,6 +1806,7 @@ class TurnRunner:
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
             # Lets the persistence block tell whether the codex app-server path self-persisted (it
-            # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
-            "agent_persisted": result.get("agent_persisted", True),
+            # didn't — see codex_runtime.py); legacy runtimes omit the flag, so default to whether
+            # this exact agent received a SessionDB handle at construction.
+            "agent_persisted": result.get("agent_persisted", self._agent_session_db_available),
         }

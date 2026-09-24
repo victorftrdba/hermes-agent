@@ -1628,16 +1628,21 @@ class GatewayTurnMixin:
         store = self.async_session_store
         sid = session_entry.session_id
         history = prepared.history
-        # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
-        # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
         # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
         # the DB write here to prevent the duplicate-write bug (#860 / #42039). This holds for the codex
         # app-server runtime too: although it early-returns and bypasses conversation_loop's per-step
         # flushes, it flushes its own projected assistant/tool messages before returning and reports
-        # agent_persisted=True (see agent/codex_runtime.py). Reading the flag (default = self._session_db is
-        # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
-        # into a gateway-side write by returning False.
-        agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        # agent_persisted=True (see agent/codex_runtime.py). When a legacy runtime omits the flag,
+        # use the handle state captured when its agent was constructed, not post-turn readiness: the
+        # preparation child can attach while the turn is running. Results from older callers that
+        # predate that capture retain the prior ready-handle default to avoid duplicate DB writes.
+        session_db_available = bool(await store.has_prepared_db_for_session(sid))
+        agent_session_db_available = agent_result.get("agent_session_db_available")
+        if agent_session_db_available is None:
+            agent_session_db_available = session_db_available
+        agent_persisted = bool(
+            agent_result.get("agent_persisted", agent_session_db_available)
+        ) and bool(agent_session_db_available) and session_db_available
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
 
         if is_context_overflow_failure:
@@ -1761,9 +1766,12 @@ class GatewayTurnMixin:
         # Replay can coalesce inputs; only this input's durable marker establishes ownership.
         try:
             if prepared.message_text is not None and session_entry is not None:
-                _owned = await self.async_session_store.has_input_owner(
-                    prepared.persistence_session_id, prepared.persistence_owner,
-                )
+                try:
+                    _owned = await self.async_session_store.has_input_owner(
+                        prepared.persistence_session_id, prepared.persistence_owner,
+                    )
+                except TranscriptReadError:
+                    _owned = False
                 if not _owned:
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id, self._hmwa_user_transcript_entry(event, prepared, time.time()),
@@ -3816,11 +3824,14 @@ class GatewayTurnMixin:
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if isinstance(result, dict):
+                result.setdefault("agent_session_db_available", False)
+            return result
 
         from run_agent import AIAgent
 
@@ -3880,4 +3891,13 @@ class GatewayTurnMixin:
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+        if isinstance(response, dict):
+            agent = turn_ctx.agent_holder[0]
+            response.setdefault(
+                "agent_session_db_available",
+                bool(getattr(
+                    agent, "_gateway_constructed_with_session_db",
+                    getattr(agent, "_session_db", None) is not None,
+                )),
+            )
         return response

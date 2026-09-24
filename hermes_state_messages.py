@@ -42,6 +42,7 @@ _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
+_TRANSCRIPT_SPOOL_ID_METADATA_KEY = "_hermes_spool_record_id"
 
 
 def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
@@ -173,6 +174,15 @@ class SessionMessagesMixin:
             return None
         return meta
 
+    @classmethod
+    def _decode_exposed_display_metadata(cls, raw: Any) -> Optional[Dict[str, Any]]:
+        meta = cls._decode_display_metadata(raw)
+        if not meta or _TRANSCRIPT_SPOOL_ID_METADATA_KEY not in meta:
+            return meta
+        exposed = dict(meta)
+        exposed.pop(_TRANSCRIPT_SPOOL_ID_METADATA_KEY, None)
+        return exposed or None
+
     @staticmethod
     def _reasoning_json_text(value: Any) -> Optional[str]:
         """Serialize a structured reasoning field for its TEXT column. Strings are stored as-is: round-trips
@@ -286,10 +296,17 @@ class SessionMessagesMixin:
         effect_disposition: Optional[str] = None, _compressed_summary: bool = False, timestamp: Any = None,
         api_content: Optional[str] = None, display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None, compression_lock_holder: Optional[str] = None,
-        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0) -> int:
+        turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
+        spool_record_id: Optional[str] = None) -> int:
         """Append one message; returns the row id and bumps the session counters. ``platform_message_id``:
         the platform's own id. ``api_content``: byte-fidelity sidecar, the exact string sent to the API when
         it differed from ``content``, stored as sent except lone surrogates."""
+        if spool_record_id:
+            metadata = self._decode_display_metadata(
+                self._encode_display_metadata(display_metadata)
+            ) or {}
+            metadata[_TRANSCRIPT_SPOOL_ID_METADATA_KEY] = spool_record_id
+            display_metadata = metadata
         msg = dict(locals())  # every keyword above is a message-dict field of the same name
         # Encode outside the write txn (display metadata first: log-order parity).
         msg["display_metadata"] = self._encode_display_metadata(display_metadata)
@@ -298,6 +315,16 @@ class SessionMessagesMixin:
         params = self._message_row_params(
             session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=True)
         def _do(conn):
+            if spool_record_id:
+                existing = conn.execute(
+                    """SELECT id FROM messages WHERE display_metadata IS NOT NULL
+                    AND CASE WHEN json_valid(display_metadata)
+                        THEN json_extract(display_metadata, '$._hermes_spool_record_id') END = ?
+                    LIMIT 1""",
+                    (spool_record_id,),
+                ).fetchone()
+                if existing is not None:
+                    return existing[0]
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
@@ -756,7 +783,9 @@ class SessionMessagesMixin:
             msg["tool_calls"] = _json_or(
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
-            msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            msg["display_metadata"] = self._decode_exposed_display_metadata(
+                msg["display_metadata"]
+            )
         return msg
 
     @staticmethod
@@ -955,7 +984,9 @@ class SessionMessagesMixin:
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
-            if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
+            if row["display_metadata"] and (
+                decoded := self._decode_exposed_display_metadata(row["display_metadata"])
+            ) is not None:
                 msg["display_metadata"] = decoded
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True
@@ -1138,7 +1169,9 @@ class SessionMessagesMixin:
             raise ValueError("rewind target is not active")
         handoff, live_view = split_user_originated_turn({
             **target_row, "content": self._decode_content(target_row.get("content")),
-            "display_metadata": self._decode_display_metadata(target_row.get("display_metadata"))})
+            "display_metadata": self._decode_exposed_display_metadata(
+                target_row.get("display_metadata")
+            )})
         if live_view is None:
             raise ValueError("rewind target is not a user-originated turn")
         live_content = live_view.get("content")

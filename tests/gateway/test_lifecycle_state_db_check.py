@@ -13,10 +13,8 @@ The check is gated on the unclean exit precisely because it costs ~2s on a
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
-import threading
 from pathlib import Path
 
 import pytest
@@ -26,7 +24,7 @@ from gateway.lifecycle_ledger import (
     get_lifecycle_sentinel_path,
     record_startup,
 )
-from gateway.run import GatewayRunner, _start_gateway_record_lifecycle_startup
+from gateway.run import _start_gateway_record_lifecycle_startup
 
 _DEAD_PID = 2 ** 22 + 12345  # beyond default pid_max; never alive
 
@@ -129,51 +127,19 @@ def test_clean_exit_does_not_pay_for_the_check(tmp_path: Path, monkeypatch) -> N
     assert not called, "integrity check ran on a clean boot"
 
 
-@pytest.mark.asyncio
-async def test_gateway_runs_unclean_exit_report_off_loop(tmp_path: Path, monkeypatch) -> None:
+def test_gateway_defers_unclean_exit_report_to_bootstrap_child(
+    tmp_path: Path, monkeypatch,
+) -> None:
     _write_sentinel(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    started = threading.Event()
-    release = threading.Event()
+    monkeypatch.setattr(
+        "gateway.lifecycle_ledger.check_state_db_integrity",
+        lambda **kwargs: pytest.fail("gateway process touched SQLite integrity check"),
+    )
 
-    def blocked_check(**kwargs) -> str:
-        started.set()
-        release.wait(timeout=5)
-        return "ok"
+    evidence = _start_gateway_record_lifecycle_startup()
 
-    monkeypatch.setattr("gateway.lifecycle_ledger.check_state_db_integrity", blocked_check)
-    runner = GatewayRunner.__new__(GatewayRunner)
-    runner._background_tasks = set()
-    runner._executor_lock = threading.Lock()
-    runner._executor = None
-    runner._executor_closing = False
-
-    task = _start_gateway_record_lifecycle_startup(runner)
-    assert task is not None
-    assert task in runner._background_tasks
+    assert evidence is not None
     sentinel = json.loads(get_lifecycle_sentinel_path(tmp_path).read_text(encoding="utf-8"))
     assert sentinel["pid"] != _DEAD_PID
-
-    try:
-        for _ in range(100):
-            if started.is_set():
-                break
-            await asyncio.sleep(0.005)
-        assert started.is_set()
-
-        ticks = 0
-        for _ in range(10):
-            await asyncio.sleep(0)
-            ticks += 1
-        assert ticks == 10
-        assert not task.done()
-    finally:
-        release.set()
-
-    await asyncio.wait_for(task, timeout=2)
-    await asyncio.sleep(0)
-    records = _exit_diag_records(tmp_path)
-    assert len(records) == 1
-    assert records[0]["state_db_integrity"] == "ok"
-    assert task not in runner._background_tasks
-    assert GatewayRunner._shutdown_executor(runner, drain_timeout=1) == 0
+    assert _exit_diag_records(tmp_path) == []

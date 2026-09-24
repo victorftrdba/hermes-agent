@@ -826,8 +826,10 @@ class GatewayNotificationsMixin:
         profile = parts[1] if len(parts) >= 5 and parts[0] == "agent" and parts[1] != "main" else None
         if session_key:
             try:
-                self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
+                if entry is None:
+                    self.session_store._ensure_loaded()
+                    entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
                     return entry.origin
             except Exception as exc:
