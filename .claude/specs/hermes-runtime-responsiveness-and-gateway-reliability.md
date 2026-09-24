@@ -21,6 +21,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 9. Operational preflight records current load, CPU, memory/swap, and active long-running work before activation. No unrelated task, container, or virtual machine is stopped without separate exact action-time confirmation.
 10. Read-only database health checks succeed before activation. Backup, rebuild, vacuum, FTS repair, session deletion, or schema work is a separately gated operation only if a health check proves it necessary.
 11. Telegram command-menu generation never performs skill discovery or skill-file reads on the Gateway event-loop thread, both after connect/reconnect and during lazy forum registration.
+12. Unclean-exit lifecycle recovery claims the new process sentinel immediately and runs the potentially long `state.db` integrity diagnostic outside the Gateway event-loop/startup critical path. The result is still persisted and logged, while a stalled check cannot prevent health binding, platform startup, or loop progress.
 
 ## Non-goals
 
@@ -59,6 +60,14 @@ Share a TTL/signature-scoped, collision-preserving discovery snapshot between li
 
 Move command-menu generation, including any cache miss and skill-file scan, off the Gateway event-loop thread for post-connect housekeeping and lazy forum registration. Preserve command ordering, caps, scope registration, and failure handling.
 
+### PR 5: Lifecycle integrity diagnostic isolation
+
+- `gateway/lifecycle_ledger.py`
+- `gateway/run.py`
+- focused lifecycle/startup regression tests
+
+Split the fast sentinel claim from the unclean-exit integrity report, retain the report as owned background work, and execute the SQLite check outside the Gateway event loop. Preserve synchronous `record_startup` compatibility and all diagnostic evidence.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -74,6 +83,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 7 | Existing Telegram polling/reconnect, Desktop resume, and SQLite/FTS fallback suites |
 | 8, 9, 10 | Exact-SHA activation receipt, preflight snapshot, read-only DB checks, live smoke, and post-restart log comparison |
 | 11 | Event-loop progress tests while Telegram command-menu skill discovery is deliberately blocked, covering post-connect and forum paths |
+| 12 | A deliberately blocked integrity check cannot delay sentinel reclaim or event-loop heartbeat; release completes the existing diagnostic record and verdict |
 
 ## Risks and mitigations
 
@@ -84,3 +94,4 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 - Restart can interrupt active conversations. Mitigation: bounded drain, exact preflight, supervised restart, and explicit rollback SHA.
 - Host resource bursts can amplify product latency independently. Mitigation: correlate live smoke with host metrics and report product and host evidence separately.
 - A cached skill map can still miss under profile/platform changes and trigger filesystem reads. Mitigation: keep menu generation off the event loop even when the cache is cold or invalidated.
+- An integrity check can take far longer than expected on a multi-gigabyte WAL-backed store. Mitigation: reclaim lifecycle ownership first, run the diagnostic as retained executor work, and surface late failure without gating health or adapter startup.

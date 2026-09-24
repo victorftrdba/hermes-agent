@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from gateway.lifecycle_ledger import (
+    claim_startup,
     detect_unclean_exit,
     get_lifecycle_sentinel_path,
     mark_exited,
@@ -141,6 +142,29 @@ def test_record_startup_persists_unclean_report_and_reclaims(tmp_path: Path) -> 
     sentinel = _read_sentinel(tmp_path)
     assert sentinel["phase"] == "running"
     assert sentinel["pid"] == os.getpid()
+
+
+def test_claim_startup_reclaims_before_integrity_report(tmp_path: Path, monkeypatch) -> None:
+    _write_sentinel(tmp_path, {
+        "phase": "running",
+        "pid": _DEAD_PID,
+        "start_time": 1000.0,
+        "started_at": "2026-07-11T04:30:00+00:00",
+    })
+    called = []
+    monkeypatch.setattr(
+        "gateway.lifecycle_ledger.check_state_db_integrity",
+        lambda **kwargs: called.append(kwargs) or "ok",
+    )
+
+    evidence = claim_startup(home=tmp_path)
+
+    assert evidence is not None
+    assert called == []
+    sentinel = _read_sentinel(tmp_path)
+    assert sentinel["phase"] == "running"
+    assert sentinel["pid"] == os.getpid()
+    assert sentinel["prior_unclean_exit"] is True
 
 
 def test_record_startup_carries_unclean_flags_onto_new_sentinel(
