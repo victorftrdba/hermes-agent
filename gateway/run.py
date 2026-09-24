@@ -5177,6 +5177,26 @@ async def _start_gateway_shutdown_tail(
     return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
 
 
+def _start_gateway_record_lifecycle_startup(runner) -> Optional[asyncio.Task]:
+    """Claim lifecycle ownership now and defer any unclean-exit database check."""
+    from gateway.lifecycle_ledger import claim_startup, report_unclean_exit
+
+    evidence = claim_startup()
+    if evidence is None:
+        return None
+
+    async def _report() -> None:
+        await runner._run_in_executor_with_context(report_unclean_exit, evidence)
+
+    task = runner._retain_background_task(
+        asyncio.create_task(_report(), name="gateway-unclean-exit-report")
+    )
+    task.add_done_callback(
+        runner._late_failure_callback("background unclean-exit report failed")
+    )
+    return task
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop deadlocks)."""
@@ -5260,20 +5280,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file():
         return False
 
+    _best_effort(
+        lambda: _start_gateway_record_lifecycle_startup(runner),
+        "Lifecycle ledger startup record failed: %s",
+    )
+
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
-
-    def _lifecycle_record_startup() -> None:
-        # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
-        # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
-        from gateway.lifecycle_ledger import record_startup
-        record_startup()
 
     def _start_keepalive() -> None:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
         start_nous_auth_keepalive()
 
-    _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 

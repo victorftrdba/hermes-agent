@@ -183,33 +183,34 @@ def check_state_db_integrity(home: Optional[Path] = None) -> str:
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
 
 
-def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None:
-    """Integrity-check the store, persist the exit-diag record, log at WARNING."""
-    # The death may have torn the store; this is the only moment we know to look.
-    verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-    if verdict not in ("ok", "absent"):
-        logger.error(
-            "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
-            "missing until it is repaired. Run `hermes doctor`.",
-            verdict,
+def report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path] = None) -> None:
+    """Integrity-check the store, persist the exit-diag record, log at WARNING. Never raises."""
+    try:
+        verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
+        if verdict not in ("ok", "absent"):
+            logger.error(
+                "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
+                "missing until it is repaired. Run `hermes doctor`.",
+                verdict,
+            )
+        _append_exit_diag(
+            {"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home,
         )
-    _append_exit_diag({"ts": _now_iso(), "tag": "gateway.previous_unclean_exit", "pid": os.getpid(), **evidence}, home)
-    logger.warning(
-        "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
-        "VM death). last_heartbeat_at=%s last_mem=%s suspected_oom=%s",
-        evidence.get("prior_pid"), evidence.get("prior_started_at"), evidence.get("last_heartbeat_at"),
-        evidence.get("last_heartbeat_mem"), evidence.get("suspected_oom", False),
-    )
+        logger.warning(
+            "Previous gateway life (pid=%s, started_at=%s) exited UNCLEANLY (no exit path ran — SIGKILL / OOM / "
+            "VM death). last_heartbeat_at=%s last_mem=%s suspected_oom=%s",
+            evidence.get("prior_pid"), evidence.get("prior_started_at"), evidence.get("last_heartbeat_at"),
+            evidence.get("last_heartbeat_mem"), evidence.get("suspected_oom", False),
+        )
+    except Exception:
+        logger.debug("Unclean-exit report failed", exc_info=True)
 
 
-def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Boot entry point: report any unclean previous exit (evidence dict, also persisted
-    to ``gateway-exit-diag.log`` and logged at WARNING) then claim the sentinel.  Never raises."""
+def claim_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Claim the current gateway life and return prior unclean-exit evidence. Never checks SQLite."""
     evidence: Optional[Dict[str, Any]] = None
     try:
         evidence = detect_unclean_exit(home)
-        if evidence is not None:
-            _report_unclean_exit(evidence, home)
     except Exception:
         logger.debug("Unclean-exit detection failed", exc_info=True)
     try:
@@ -224,6 +225,14 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
+    return evidence
+
+
+def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Synchronously claim this life and report a prior unclean exit. Never raises."""
+    evidence = claim_startup(home)
+    if evidence is not None:
+        report_unclean_exit(evidence, home)
     return evidence
 
 
