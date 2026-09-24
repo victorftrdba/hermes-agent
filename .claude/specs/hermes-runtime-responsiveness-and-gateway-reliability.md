@@ -23,6 +23,10 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 11. Telegram command-menu generation never performs skill discovery or skill-file reads on the Gateway event-loop thread, both after connect/reconnect and during lazy forum registration.
 12. Unclean-exit lifecycle recovery claims the new process sentinel immediately and runs the potentially long `state.db` integrity diagnostic outside the Gateway event-loop/startup critical path. The result is still persisted and logged, while a stalled check cannot prevent health binding, platform startup, or loop progress.
 13. Gateway construction is cache-only and never opens, migrates, checks, repairs, archives, prunes, vacuums, or rebuilds SQLite. After PID, lifecycle, and control-socket claims, one internal subprocess per exact profile DB path performs bootstrap plus configured database and checkpoint maintenance without gating adapters or health. Pending and failed paths remain on durable JSON/JSONL/spool fallback; success attaches only the prepared path off-loop and reconciles fallback state. Shutdown disables late attachment and terminates, kills if necessary, and reaps every bootstrap child.
+14. The built-in cron scheduler runs in a spawn-isolated child process and never opens the central `state.db` or cron delivery SQLite from the Gateway PID. The child preserves default and multiplex profile scoping, due-job claims, recovery, heartbeats, and durable restart-safe delivery persistence; the Gateway performs only child-requested live-adapter transport and returns the result to the child.
+15. Authenticated cron-fire admission crosses the cron child boundary before the API acknowledges it. Accepted work retains `202` behavior, duplicate claims retain their existing response, and provider errors remain retryable without executing scheduler or ledger SQLite in the Gateway.
+16. A missing, failed, hung, or repeatedly crashing cron child marks cron degraded and restarts with bounded backoff while Gateway health, control, Telegram, webhook, and conversation handling remain responsive. The Gateway never silently falls back to in-process cron execution.
+17. Shutdown disables new cron dispatch, reports child active-work status, waits within the configured drain budget, then terminates, kills if necessary, and reaps the cron child without blocking the Gateway event loop. External cron providers preserve their current provider and loopback-fire contracts.
 
 ## Non-goals
 
@@ -81,6 +85,17 @@ Split the fast sentinel claim from the unclean-exit integrity report, retain the
 
 Keep `GatewayRunner` and its `SessionStore` cache-only until the control socket is live. Bootstrap each exact profile path in an internal Python subprocess, preserve non-Gateway eager `SessionStore` compatibility, attach prepared handles off-loop, reconcile durable fallback data, and enforce bounded child termination and reaping during shutdown. Route lifecycle integrity and periodic SessionDB housekeeping across the same process boundary.
 
+### PR 7: Gateway cron process isolation
+
+- `cron/scheduler_process.py`
+- `cron/scheduler_delivery.py` and/or `cron/delivery_queue.py`
+- `gateway/run.py`
+- `gateway/run_shutdown.py`
+- `gateway/platforms/api_server.py`
+- focused cron process, fire-webhook, multiplexing, liveness, and shutdown tests
+
+Move the built-in ticker, central-ledger access, recovery, due-job admission, execution, and delivery persistence into a spawn-isolated child. Split transport from persistence so the child requests a live-adapter send from the Gateway and records its result, expose child health and active-work accounting, and fail closed with bounded restart backoff instead of falling back to the in-process scheduler. Preserve external-provider behavior.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -98,6 +113,10 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 11 | Event-loop progress tests while Telegram command-menu skill discovery is deliberately blocked, covering post-connect and forum paths |
 | 12 | A deliberately blocked integrity check cannot delay sentinel reclaim or event-loop heartbeat; release completes the existing diagnostic record and verdict |
 | 13 | Constructor spies prove zero SQLite construction; blocked-child startup proves control/health/adapters progress; fallback/reconciliation, failure/backoff/retry with retained lifecycle evidence, exact-path profile isolation and maintenance, checkpoint pruning, shutdown reap/no-late-attach, and lifecycle/housekeeping process-boundary tests pass |
+| 14 | `tests/cron/test_scheduler_process.py` proves the child PID owns built-in ticker, central-state access, and delivery persistence; default and multiplex scopes remain exact; Gateway performs adapter transport without opening SQLite |
+| 15 | `tests/gateway/test_cron_fire_webhook.py` proves authenticated admission waits for a correlated child response, accepted and duplicate responses remain compatible, and child/provider failures return retryable errors |
+| 16 | `tests/cron/test_scheduler_process.py` crash, hung-child, exponential-backoff, degraded-health, and no-in-process-fallback cases plus `tests/cron/test_87033_cronjob_gateway_liveness.py` loop-progress coverage |
+| 17 | `tests/gateway/test_gateway_shutdown.py` and cron-process lifecycle tests prove dispatch pause, active-count drain, graceful exit, terminate/kill escalation, full reap, and unchanged external-provider startup/fire behavior |
 
 ## Risks and mitigations
 
@@ -110,3 +129,6 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 - A cached skill map can still miss under profile/platform changes and trigger filesystem reads. Mitigation: keep menu generation off the event loop even when the cache is cold or invalidated.
 - An integrity check can take far longer than expected on a multi-gigabyte WAL-backed store. Mitigation: reclaim lifecycle ownership first, run the diagnostic in the retained bootstrap subprocess, and surface failure without gating health or adapter startup.
 - A bootstrap child can hang, fail repeatedly, or finish during shutdown; a multiplexed callback could otherwise attach the wrong profile. Mitigation: key ownership and result validation by resolved DB path, retain durable fallback until exact-path success, apply bounded retry backoff, disable callbacks before teardown, then terminate, kill, and reap each child.
+- A cron child can die after claiming work or while the host is heavily swapped. Mitigation: durable claims and delivery queues, correlated admission responses, bounded restart backoff, fail-closed dispatch, and lifecycle tests across crash points.
+- Moving cron behind IPC can accidentally serialize live adapters or change external-provider semantics. Mitigation: keep adapters in the Gateway, keep delivery persistence in the child, exchange transport requests/results only, isolate the built-in provider, and retain existing external-provider paths under regression coverage.
+- The observed `35.8 GB` swap load can still slow any process after cron isolation. Mitigation: treat host pressure as an independent operational amplifier; acceptance requires eliminating Gateway-PID cron SQLite/GIL contention, not claiming that application code can repair system-wide swap exhaustion.

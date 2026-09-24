@@ -170,8 +170,7 @@ class GatewayShutdownMixin:
             + self._active_deferred_agent_worker_count()
         )
 
-    @staticmethod
-    def _running_cron_job_count() -> int:
+    def _running_cron_job_count(self) -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
         # pool and API-server runs live on the adapter — both outside _running_agents (the #60432 blind
         # spot), so counting agents alone let a suspend land mid-cron-job. Fail-AWAKE accounting: the shared
@@ -179,6 +178,9 @@ class GatewayShutdownMixin:
         # which is fine for a drain but unsafe for a suspend predicate — a transient read failure would make
         # live work look idle and reopen the mid-job freeze. Here an unreadable source counts as work
         # (sentinel 1) so the machine stays awake until the source is readable again.
+        process_manager = getattr(self, "_cron_process_manager", None)
+        if process_manager is not None:
+            return process_manager.status.active_count
         from cron.scheduler import get_running_job_ids
         return len(get_running_job_ids())
 
@@ -615,6 +617,15 @@ class GatewayShutdownMixin:
         if self._external_drain_active:
             return
         self._external_drain_active = True
+        process_manager = getattr(self, "_cron_process_manager", None)
+        if process_manager is not None:
+            try:
+                process_manager.set_dispatch_enabled(False)
+            except Exception:
+                logger.warning(
+                    "Cron scheduler process dispatch could not be paused for external drain",
+                    exc_info=True,
+                )
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
@@ -633,6 +644,15 @@ class GatewayShutdownMixin:
                 "to running (shutdown takes precedence)."
             )
             return
+        process_manager = getattr(self, "_cron_process_manager", None)
+        if process_manager is not None:
+            try:
+                process_manager.set_dispatch_enabled(True)
+            except Exception:
+                logger.warning(
+                    "Cron scheduler process dispatch could not be resumed after external drain",
+                    exc_info=True,
+                )
         logger.info(
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
@@ -1552,6 +1572,13 @@ class GatewayShutdownMixin:
         self._running = False
         self._clear_plugin_message_injector()
         self._draining = True
+        process_manager = getattr(self, "_cron_process_manager", None)
+        if process_manager is not None:
+            try:
+                process_manager.set_dispatch_enabled(False)
+                await asyncio.to_thread(process_manager.refresh_status)
+            except Exception:
+                logger.warning("Cron scheduler process dispatch could not be paused", exc_info=True)
         # getattr-guards: shutdown-path test doubles may lack the room worker / systemd watchdog.
         stop_room_worker = getattr(self, "_stop_hosted_room_worker", None)
         if callable(stop_room_worker):

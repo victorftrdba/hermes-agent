@@ -255,25 +255,48 @@ def _drain_runner():
 
 
 class TestDrainStateMachine:
+    def test_enter_pauses_cron_process_dispatch(self):
+        runner, _ = _drain_runner()
+        runner._cron_process_manager = MagicMock()
 
+        runner._enter_external_drain()
+
+        runner._cron_process_manager.set_dispatch_enabled.assert_called_once_with(False)
 
     def test_enter_idempotent(self):
         runner, _ = _drain_runner()
+        runner._cron_process_manager = MagicMock()
         runner._enter_external_drain()
         runner._update_runtime_status.reset_mock()
+        runner._cron_process_manager.set_dispatch_enabled.reset_mock()
         runner._enter_external_drain()  # second call — no-op
         runner._update_runtime_status.assert_not_called()
+        runner._cron_process_manager.set_dispatch_enabled.assert_not_called()
 
+    def test_exit_resumes_cron_process_dispatch_while_running(self):
+        runner, _ = _drain_runner()
+        runner._cron_process_manager = MagicMock()
+        runner._enter_external_drain()
+        runner._cron_process_manager.set_dispatch_enabled.reset_mock()
+
+        runner._exit_external_drain()
+
+        assert runner._external_drain_active is False
+        runner._cron_process_manager.set_dispatch_enabled.assert_called_once_with(True)
+        runner._update_runtime_status.assert_called_with("running")
 
     def test_exit_during_shutdown_does_not_revert_to_running(self):
         runner, _ = _drain_runner()
+        runner._cron_process_manager = MagicMock()
         runner._enter_external_drain()
         runner._update_runtime_status.reset_mock()
+        runner._cron_process_manager.set_dispatch_enabled.reset_mock()
         # A shutdown drain is now in progress — exit must NOT resurrect running.
         runner._draining = True
         runner._exit_external_drain()
         assert runner._external_drain_active is False
         runner._update_runtime_status.assert_not_called()
+        runner._cron_process_manager.set_dispatch_enabled.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -325,4 +348,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-
