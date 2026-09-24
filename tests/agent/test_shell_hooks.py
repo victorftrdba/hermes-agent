@@ -151,6 +151,27 @@ class TestSerializePayload:
         payload = json.loads(raw)
         assert payload["tool_input"] is None
 
+    def test_cwd_uses_session_override_not_process_cwd(self, tmp_path, monkeypatch):
+        """Regression: _payload_fields used str(Path.cwd()) — the desktop process cwd —
+        instead of resolve_agent_cwd()'s session -> terminal -> process precedence."""
+        import agent.runtime_cwd as rt
+
+        session = tmp_path / "session"
+        terminal = tmp_path / "terminal"
+        process = tmp_path / "process"
+        for d in (session, terminal, process):
+            d.mkdir()
+        monkeypatch.chdir(process)
+        monkeypatch.setenv("TERMINAL_CWD", str(terminal))
+        token = rt.set_session_cwd(str(session))
+        try:
+            payload = json.loads(shell_hooks._serialize_payload(
+                "pre_tool_call", {"tool_name": "terminal", "args": {"command": "ls"}},
+            ))
+            assert payload["cwd"] == str(session)
+        finally:
+            rt._SESSION_CWD.reset(token)
+
 
 
 

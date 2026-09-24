@@ -30,6 +30,7 @@ try:
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
+from agent.runtime_cwd import resolve_agent_cwd
 from hermes_constants import get_hermes_home
 from utils import atomic_replace
 
@@ -80,7 +81,7 @@ def _utc_now_iso() -> str:
 def _payload_fields(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Common stdin/POST payload fields (shared with outbound webhooks); key order is wire order."""
     try:
-        cwd = str(Path.cwd())
+        cwd = str(resolve_agent_cwd())
     except OSError:
         cwd = ""
     return {

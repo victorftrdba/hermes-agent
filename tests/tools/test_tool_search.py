@@ -420,6 +420,58 @@ class TestBridgeDispatch:
 
 
 class TestHandleFunctionCallIntegration:
+    def test_invoke_tool_regates_deferred_calls(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        from agent.agent_runtime_helpers import invoke_tool
+        from hermes_cli import plugins
+        from tools.registry import registry
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        manager = plugins.PluginManager()
+        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(registry, "_tools", dict(registry._tools))
+        sensitive = "mcp_hook_sensitive_fixture"
+        ordinary = "mcp_hook_ordinary_fixture"
+        seen = []
+        executed = []
+
+        def gate(tool_name, **kwargs):
+            seen.append(tool_name)
+            if tool_name == sensitive:
+                return {"action": "block", "message": "sensitive fixture blocked"}
+            return {"action": "allow"}
+
+        manager._hooks["pre_tool_call"] = [gate]
+        for name in (sensitive, ordinary):
+            def handler(args, name=name, **kwargs):
+                executed.append(name)
+                return json.dumps({"executed": name})
+
+            registry.register(
+                name=name, toolset="mcp-hook-regression", schema=_td(name), handler=handler,
+            )
+        agent = SimpleNamespace(
+            session_id="hook-regression", valid_tool_names={sensitive, ordinary, "tool_call"},
+            enabled_toolsets=["mcp-hook-regression"], disabled_toolsets=None,
+            _memory_manager=None,
+        )
+
+        blocked = json.loads(invoke_tool(
+            agent, "tool_call", {"calls": [{"name": sensitive, "arguments": {}}]},
+            "hook-regression", tool_call_id="sensitive-call",
+        ))
+        assert blocked == {"error": "sensitive fixture blocked"}
+        assert seen == ["tool_call", sensitive]
+        assert executed == []
+
+        allowed = json.loads(invoke_tool(
+            agent, "tool_call", {"calls": [{"name": ordinary, "arguments": {}}]},
+            "hook-regression", tool_call_id="ordinary-call",
+        ))
+        assert allowed == {"executed": ordinary}
+        assert seen == ["tool_call", sensitive, "tool_call", ordinary]
+        assert executed == [ordinary]
+
     def test_tool_search_dispatch_through_handle_function_call(self):
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools
