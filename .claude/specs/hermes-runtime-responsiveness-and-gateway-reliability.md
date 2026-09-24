@@ -22,6 +22,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 10. Read-only database health checks succeed before activation. Backup, rebuild, vacuum, FTS repair, session deletion, or schema work is a separately gated operation only if a health check proves it necessary.
 11. Telegram command-menu generation never performs skill discovery or skill-file reads on the Gateway event-loop thread, both after connect/reconnect and during lazy forum registration.
 12. Unclean-exit lifecycle recovery claims the new process sentinel immediately and runs the potentially long `state.db` integrity diagnostic outside the Gateway event-loop/startup critical path. The result is still persisted and logged, while a stalled check cannot prevent health binding, platform startup, or loop progress.
+13. Gateway construction is cache-only and never opens, migrates, checks, repairs, archives, prunes, vacuums, or rebuilds SQLite. After PID, lifecycle, and control-socket claims, one internal subprocess per exact profile DB path performs bootstrap plus configured database and checkpoint maintenance without gating adapters or health. Pending and failed paths remain on durable JSON/JSONL/spool fallback; success attaches only the prepared path off-loop and reconciles fallback state. Shutdown disables late attachment and terminates, kills if necessary, and reaps every bootstrap child.
 
 ## Non-goals
 
@@ -68,6 +69,18 @@ Move command-menu generation, including any cache miss and skill-file scan, off 
 
 Split the fast sentinel claim from the unclean-exit integrity report, retain the report as owned background work, and execute the SQLite check outside the Gateway event loop. Preserve synchronous `record_startup` compatibility and all diagnostic evidence.
 
+### PR 6: Gateway SessionDB bootstrap process isolation
+
+- `gateway/run.py`
+- `gateway/run_startup.py`
+- `gateway/run_shutdown.py`
+- `gateway/session.py`
+- `gateway/session_persistence.py`
+- `gateway/session_db_recovery.py`
+- focused Gateway bootstrap, fallback, multiplexing, and shutdown tests
+
+Keep `GatewayRunner` and its `SessionStore` cache-only until the control socket is live. Bootstrap each exact profile path in an internal Python subprocess, preserve non-Gateway eager `SessionStore` compatibility, attach prepared handles off-loop, reconcile durable fallback data, and enforce bounded child termination and reaping during shutdown. Route lifecycle integrity and periodic SessionDB housekeeping across the same process boundary.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -84,6 +97,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 8, 9, 10 | Exact-SHA activation receipt, preflight snapshot, read-only DB checks, live smoke, and post-restart log comparison |
 | 11 | Event-loop progress tests while Telegram command-menu skill discovery is deliberately blocked, covering post-connect and forum paths |
 | 12 | A deliberately blocked integrity check cannot delay sentinel reclaim or event-loop heartbeat; release completes the existing diagnostic record and verdict |
+| 13 | Constructor spies prove zero SQLite construction; blocked-child startup proves control/health/adapters progress; fallback/reconciliation, failure/backoff/retry with retained lifecycle evidence, exact-path profile isolation and maintenance, checkpoint pruning, shutdown reap/no-late-attach, and lifecycle/housekeeping process-boundary tests pass |
 
 ## Risks and mitigations
 
@@ -94,4 +108,5 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 - Restart can interrupt active conversations. Mitigation: bounded drain, exact preflight, supervised restart, and explicit rollback SHA.
 - Host resource bursts can amplify product latency independently. Mitigation: correlate live smoke with host metrics and report product and host evidence separately.
 - A cached skill map can still miss under profile/platform changes and trigger filesystem reads. Mitigation: keep menu generation off the event loop even when the cache is cold or invalidated.
-- An integrity check can take far longer than expected on a multi-gigabyte WAL-backed store. Mitigation: reclaim lifecycle ownership first, run the diagnostic as retained executor work, and surface late failure without gating health or adapter startup.
+- An integrity check can take far longer than expected on a multi-gigabyte WAL-backed store. Mitigation: reclaim lifecycle ownership first, run the diagnostic in the retained bootstrap subprocess, and surface failure without gating health or adapter startup.
+- A bootstrap child can hang, fail repeatedly, or finish during shutdown; a multiplexed callback could otherwise attach the wrong profile. Mitigation: key ownership and result validation by resolved DB path, retain durable fallback until exact-path success, apply bounded retry backoff, disable callbacks before teardown, then terminate, kill, and reap each child.

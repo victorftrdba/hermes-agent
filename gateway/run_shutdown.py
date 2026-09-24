@@ -1744,6 +1744,11 @@ class GatewayShutdownMixin:
     def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: "GatewayShutdownMixin._StopContext") -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""
         from gateway.run import GatewayRunner, _EXECUTOR_QUIESCE_TIMEOUT
+        stop_preparation = getattr(self, "stop_session_db_preparation", None)
+        if callable(stop_preparation):
+            GatewayShutdownMixin._quiet_step(
+                "SessionDB bootstrap process stop error", lambda: stop_preparation(timeout=2.0),
+            )
         # Quiesce the thread pool BEFORE closing session DBs: a late executor write after
         # SessionDB.close() checkpointed the WAL reopens the handle and splits the WAL generation
         # (close-time corruption). Clamped to the remaining watchdog leash minus 1s for the close.

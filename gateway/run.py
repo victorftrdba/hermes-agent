@@ -3418,11 +3418,16 @@ class GatewayRunner(
 
     def _init_session_store(self) -> None:
         """Build the SessionStore (with process-registry reset guard), its async facade and the router."""
+        from gateway.session_db_recovery import SessionDBPreparationManager
         from tools.process_registry import process_registry
+        self._session_db_preparation = SessionDBPreparationManager()
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
-                key))
+                key),
+            eager_session_db=False,
+            db_preparation=self._session_db_preparation,
+        )
         # Loop-side boundary: sync helpers use ``session_store`` directly; async handlers await this facade.
         self._async_session_store = AsyncSessionStore(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
@@ -3564,67 +3569,44 @@ class GatewayRunner(
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
     def _init_session_db(self) -> None:
-        """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
-        # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
-        # root home under multiplex); priming here keeps startup diagnostics at init.
-        # Initialize session database for session_search tool support. Same frozen-handle class of bug as
-        # SessionStore._db (#88532): a handle bound here is pinned to the process's root home, but /resume,
-        # /title, /history and session search all run inside _profile_runtime_scope on a multiplexed gateway
-        # and must see that profile's own state.db.
+        """Initialize cache-only SessionDB state; bootstrap starts after the control socket."""
         self._session_db_pinned: Any = _SESSION_DB_UNPINNED
         self._session_db_handles: Dict[Path, Any] = {}
         self._session_db_handles_lock = threading.Lock()
         from gateway.session_db_recovery import RecoverableHandleCache
         self._session_db_handle_cache = RecoverableHandleCache(
             handles=self._session_db_handles, lock=self._session_db_handles_lock)
-        try:
-            self._open_session_db_for_active_scope(raise_on_error=True)
-        except Exception as e:
-            # WARNING (not DEBUG) so it lands in errors.log; else an NFS HERMES_HOME silently loses /resume etc.
-            logger.warning("SQLite session store not available: %s", e)
-            self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
 
-        # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
-        # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
-        # Surface the failure to the user via their home channel(s) once the gateway connects. Without this,
-        # state.db corruption or NFS/SMB lock failures silently degrade the entire gateway — messages may
-        # flow but nothing is persisted, and the user has no indication until they try /resume and find
-        # nothing (#88235).
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_archive", False):
-                    self._session_db._db.maybe_auto_archive(
-                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        min_vacuum_interval_days=int(
-                            _sess_cfg.get("min_vacuum_interval_days", 30)),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir)
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
+    def start_session_db_preparation(self, lifecycle_evidence: Optional[dict] = None) -> str:
+        from hermes_cli.config import load_config as _load_full_config
+        from hermes_state import _default_db_path
+        from gateway.session_db_recovery import configured_settings
 
-        # Stale checkpoint repo cleanup; opt-in via checkpoints.auto_prune, idempotent via .last_prune.
-        try:
-            from hermes_cli.config import load_config as _load_full_config
-            _ckpt_cfg = (_load_full_config().get("checkpoints") or {})
-            if _ckpt_cfg.get("auto_prune", False):
-                from tools.checkpoint_manager import maybe_auto_prune_checkpoints
-                # delete_orphans never honoured unattended: a missing workdir is ambiguous (deleted vs.
-                # unmounted share); orphan cleanup is only via explicit `hermes checkpoints prune`.
-                maybe_auto_prune_checkpoints(
-                    retention_days=int(_ckpt_cfg.get("retention_days", 7)),
-                    min_interval_hours=int(_ckpt_cfg.get("min_interval_hours", 24)),
-                    delete_orphans=False,
-                    max_total_size_mb=int(_ckpt_cfg.get("max_total_size_mb", 500)))
-        except Exception as exc:
-            logger.debug("checkpoint auto-maintenance skipped: %s", exc)
+        settings = configured_settings(_load_full_config())
+        manager = self._session_db_preparation
+        manager.enable()
+        path = Path(_default_db_path()).expanduser().resolve()
+        home = path.parent
+        state = manager.request(
+            path, profile_home=home, sessions_dir=Path(self.config.sessions_dir),
+            on_ready=self._session_db_prepared,
+            lifecycle_evidence=lifecycle_evidence,
+            settings=settings,
+        )
+        return state
+
+    def _session_db_prepared(self, path: Path, result: dict) -> None:
+        self.session_store._attach_prepared_session_db(path, result)
+        self._session_db_init_error = None
+        self._open_session_db_for_active_scope()
+        logger.info("SQLite session store prepared outside the gateway process")
+
+    def stop_session_db_preparation(self, timeout: float = 2.0) -> None:
+        self.session_store._db_attach_enabled = False
+        self._session_db_preparation.close(timeout=timeout)
+
+    def request_session_db_maintenance(self) -> dict[Path, str]:
+        return self._session_db_preparation.request_ready_maintenance()
 
     def _init_registries_and_clocks(self) -> None:
         """Pairing stores, hook registry, voice modes, background-task set, liveness and idle clocks."""
@@ -3673,9 +3655,8 @@ class GatewayRunner(
         #88235 broadcast.
         """
         from hermes_state import AsyncSessionDB, _default_db_path
-        from hermes_state_registry import acquire
         from gateway.session_db_recovery import RecoverableHandleCache
-        path = Path(_default_db_path())
+        path = Path(_default_db_path()).expanduser().resolve()
         cache = getattr(self, "_session_db_handle_cache", None)
         if cache is None:
             # Test runners built with object.__new__ skip __init__.
@@ -3702,16 +3683,18 @@ class GatewayRunner(
             if store is not None:
                 # Store handle unavailable: opening our own would resurrect the duplicate borrowed away.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
-            try:
-                return AsyncSessionDB(acquire())
-            except Exception as exc:
-                logger.warning("SQLite session store not available: %s", exc)
-                raise
+            from hermes_state_registry import acquire
+            return AsyncSessionDB(acquire(path))
 
         def _recovered() -> None:
             self._session_db_init_error = None
             logger.info("SQLite session store recovered")
 
+        if getattr(self, "_session_db_preparation", None) is not None:
+            store = getattr(self, "session_store", None)
+            borrowed = getattr(store, "_db", None) if store is not None else None
+            if borrowed is None:
+                return None
         return cache.get(path, _open, raise_on_error=raise_on_error, on_recovered=_recovered)
 
     @property
@@ -4489,36 +4472,18 @@ def _housekeeping_org_skill_sync() -> None:
     maybe_pull_org_skills()
 
 
-def _housekeeping_auto_archive() -> None:
-    """Stale-session auto-archive on a live timer (the startup hook fires once); maybe_auto_archive()
-    is gated by sessions.min_interval_hours. Opens its own SessionDB — SQLite connections are thread-bound."""
-    from hermes_cli.config import load_config as _load_full_config
-    from hermes_state_registry import acquire, release_or_close
-    _sess_cfg = (_load_full_config().get("sessions") or {})
-    if _sess_cfg.get("auto_archive", False):
-        _adb = acquire()
-        try:
-            _adb.maybe_auto_archive(
-                idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
-                min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
-        finally:
-            release_or_close(_adb)
+def _housekeeping_auto_archive(runner=None) -> None:
+    """Ask the DB child to run configured maintenance without opening SQLite here."""
+    request = getattr(runner, "request_session_db_maintenance", None)
+    if callable(request):
+        request()
 
 
-def _housekeeping_deferred_fts_retry() -> None:
-    """A SessionDB opened while another process held the rebuild lock fails closed onto the LIKE fallback
-    and the gateway stays up for days. Non-blocking, rate-limited inside SessionDB; no-op when not stale."""
-    # Retry here, on the existing tick, against the shared instances this process already holds:
-    # non-blocking admission, no new thread, rate-limited inside SessionDB. No-op when nothing is stale (one
-    # attribute read per instance). See #100108.
-    from hermes_state_registry import borrow_live_shared_session_dbs
-    with borrow_live_shared_session_dbs() as _session_dbs:
-        for _sdb in _session_dbs:
-            _retry = getattr(_sdb, "retry_deferred_fts_recovery", None)
-            if callable(_retry) and _retry():
-                logger.info(
-                    "Deferred state.db FTS rebuild completed in-process for %s; full-text search restored.",
-                    getattr(_sdb, "db_path", "state.db"))
+def _housekeeping_deferred_fts_retry(runner=None) -> None:
+    """Ask the DB child to retry FTS recovery without running SQLite on this thread."""
+    request = getattr(runner, "request_session_db_maintenance", None)
+    if callable(request):
+        request()
 
 
 def _housekeeping_memory_trim() -> None:
@@ -4574,8 +4539,8 @@ def _start_gateway_housekeeping(
         (60, "Curator tick", _housekeeping_curator),
         (60, "Sync pull tick", _housekeeping_skill_sync),
         (60, "Org sync pull tick", _housekeeping_org_skill_sync),
-        (60, "Auto-archive tick", _housekeeping_auto_archive),
-        (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
+        (60, "Auto-archive tick", lambda: _housekeeping_auto_archive(runner)),
+        (1, "Deferred FTS retry tick", lambda: _housekeeping_deferred_fts_retry(runner)),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim)]
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
@@ -5177,24 +5142,10 @@ async def _start_gateway_shutdown_tail(
     return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
 
 
-def _start_gateway_record_lifecycle_startup(runner) -> Optional[asyncio.Task]:
-    """Claim lifecycle ownership now and defer any unclean-exit database check."""
-    from gateway.lifecycle_ledger import claim_startup, report_unclean_exit
-
-    evidence = claim_startup()
-    if evidence is None:
-        return None
-
-    async def _report() -> None:
-        await runner._run_in_executor_with_context(report_unclean_exit, evidence)
-
-    task = runner._retain_background_task(
-        asyncio.create_task(_report(), name="gateway-unclean-exit-report")
-    )
-    task.add_done_callback(
-        runner._late_failure_callback("background unclean-exit report failed")
-    )
-    return task
+def _start_gateway_record_lifecycle_startup(runner=None) -> Optional[dict]:
+    """Claim lifecycle ownership without touching SQLite; the DB child reports evidence."""
+    from gateway.lifecycle_ledger import claim_startup
+    return claim_startup()
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
@@ -5280,13 +5231,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not _start_gateway_claim_pid_file():
         return False
 
-    _best_effort(
+    _lifecycle_evidence = _best_effort(
         lambda: _start_gateway_record_lifecycle_startup(runner),
         "Lifecycle ledger startup record failed: %s",
     )
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
     _control_server = await _start_gateway_start_control_socket(runner)
+
+    _best_effort(
+        lambda: runner.start_session_db_preparation(_lifecycle_evidence),
+        "Session DB bootstrap process did not start: %s",
+    )
 
     def _start_keepalive() -> None:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
@@ -5314,13 +5270,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _shutdown_gateway_health_export(runner)
         return False
 
-    def _recover_pending() -> None:
-        from gateway.shutdown_flush import recover_pending_to_db
-        recovered = recover_pending_to_db()
-        if recovered:
-            logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
-
-    _best_effort(_recover_pending)
     if runner.should_exit_cleanly:
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:

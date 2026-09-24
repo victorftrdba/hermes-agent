@@ -742,7 +742,10 @@ class SessionStore(
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
-    def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
+    def __init__(
+        self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None, *,
+        eager_session_db: bool = True, db_preparation=None,
+    ):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -798,6 +801,8 @@ class SessionStore(
         self._db_handle_cache = RecoverableHandleCache(
             handles=self._db_handles, lock=self._db_handles_lock
         )
+        self._db_preparation = db_preparation
+        self._db_attach_enabled = True
         # The routing index needs exactly one home for its lifetime: the gateway's own, captured
         # before any profile scope exists (see ``_routing_db``).
         try:
@@ -806,7 +811,8 @@ class SessionStore(
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
-        self._open_session_db_for_active_scope()
+        if eager_session_db:
+            self._open_session_db_for_active_scope()
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via

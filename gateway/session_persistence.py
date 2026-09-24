@@ -52,9 +52,28 @@ class SessionPersistenceMixin:
         that the multiplexed inbound path already performs actually reach session storage.
         """
         from hermes_state import _default_db_path
-        from hermes_state_registry import acquire
-
         path = Path(db_path) if db_path is not None else Path(_default_db_path())
+        path = path.expanduser().resolve()
+        preparation = getattr(self, "_db_preparation", None)
+        if preparation is not None:
+            with self._db_handles_lock:
+                handle = self._db_handles.get(path)
+            if handle is not None:
+                return handle
+            home = path.parent
+            routing_home = getattr(self, "_routing_home", None)
+            sessions_dir = (
+                Path(self.sessions_dir) if routing_home is not None
+                and path == (Path(routing_home) / "state.db").expanduser().resolve()
+                else home / "sessions"
+            )
+            preparation.request(
+                path, profile_home=home, sessions_dir=sessions_dir,
+                on_ready=self._attach_prepared_session_db,
+            )
+            return None
+
+        from hermes_state_registry import acquire
 
         def _open():
             try:
@@ -65,6 +84,44 @@ class SessionPersistenceMixin:
                 raise
 
         return self._db_handle_cache.get(path, _open, non_cacheable=_is_live_system_guard)
+
+    def _attach_prepared_session_db(self, path: Path, result: dict[str, Any]) -> None:
+        if not getattr(self, "_db_attach_enabled", False):
+            return
+        from hermes_state_registry import acquire
+
+        try:
+            handle = self._db_handle_cache.get(
+                path, lambda: acquire(path), raise_on_error=True,
+                non_cacheable=_is_live_system_guard,
+            )
+        except Exception as exc:
+            preparation = getattr(self, "_db_preparation", None)
+            if preparation is not None:
+                preparation.invalidate(path, exc)
+            return
+        if handle is None or not getattr(self, "_db_attach_enabled", False):
+            return
+        routing_home = getattr(self, "_routing_home", None)
+        if routing_home is not None and path == (Path(routing_home) / "state.db").resolve():
+            snapshot = None
+            with self._lock:
+                if self._loaded:
+                    snapshot = self._snapshot_routing_locked()
+            if snapshot is not None:
+                self._persist_routing_data(*snapshot)
+        try:
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            from gateway.shutdown_flush import recover_pending_to_db
+            token = set_hermes_home_override(str(path.parent))
+            try:
+                recovered = recover_pending_to_db(handle)
+            finally:
+                reset_hermes_home_override(token)
+            if recovered:
+                logger.info("Recovered %d pending message(s) after state.db bootstrap", recovered)
+        except Exception as exc:
+            logger.debug("pending transcript reconciliation after state.db bootstrap failed: %s", exc)
 
     def _pinned_db(self):
         """Return the explicitly pinned DB (``store._db = x``), else ``_DB_UNPINNED``."""
@@ -195,6 +252,8 @@ class SessionPersistenceMixin:
         """Close every SessionDB handle this store opened (one per path). Closing only ``store._db``
         would strand secondary profiles' handles with their WAL lock held ('database is locked' on
         restart). Drained under the lock, closed outside it; a pinned handle is the pinner's."""
+        self._db_attach_enabled = False
+
         def _close(db) -> None:
             from hermes_state_registry import release_or_close  # shared instances no-op on close()
             try:
