@@ -56,10 +56,6 @@ class SessionPersistenceMixin:
         path = path.expanduser().resolve()
         preparation = getattr(self, "_db_preparation", None)
         if preparation is not None:
-            with self._db_handles_lock:
-                handle = self._db_handles.get(path)
-            if handle is not None:
-                return handle
             home = path.parent
             routing_home = getattr(self, "_routing_home", None)
             sessions_dir = (
@@ -67,6 +63,16 @@ class SessionPersistenceMixin:
                 and path == (Path(routing_home) / "state.db").expanduser().resolve()
                 else home / "sessions"
             )
+            if preparation.status(path) != "ready":
+                preparation.request(
+                    path, profile_home=home, sessions_dir=sessions_dir,
+                    on_ready=self._attach_prepared_session_db,
+                )
+                return None
+            with self._db_handles_lock:
+                handle = self._db_handles.get(path)
+            if handle is not None:
+                return handle
             preparation.request(
                 path, profile_home=home, sessions_dir=sessions_dir,
                 on_ready=self._attach_prepared_session_db,
@@ -107,9 +113,9 @@ class SessionPersistenceMixin:
             snapshot = None
             with self._lock:
                 if self._loaded:
-                    snapshot = self._snapshot_routing_locked()
+                    snapshot = self._snapshot_routing_locked(routing_db=handle)
             if snapshot is not None:
-                self._persist_routing_data(*snapshot)
+                self._persist_routing_data(*snapshot, routing_db=handle)
         try:
             from hermes_constants import set_hermes_home_override, reset_hermes_home_override
             from gateway.shutdown_flush import recover_pending_to_db
@@ -267,7 +273,8 @@ class SessionPersistenceMixin:
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
 
-        self._db_handle_cache.close_all(_close)
+        with getattr(self, "_get_transcript_drain_lock")():
+            self._db_handle_cache.close_all(_close)
 
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
@@ -287,9 +294,10 @@ class SessionPersistenceMixin:
         except Exception:
             return str(self.sessions_dir)
 
-    def _routing_db_method(self, name: str):
+    def _routing_db_method(self, name: str, routing_db=None):
         """Bound ``_routing_db.<name>`` if the handle exists and has it, else None."""
-        method = getattr(self._routing_db or None, name, None)
+        db = self._routing_db if routing_db is None else routing_db
+        method = getattr(db or None, name, None)
         return method if callable(method) else None
 
     def _load_routing_rows_locked(self) -> bool:
@@ -457,12 +465,12 @@ class SessionPersistenceMixin:
         self._routing_generation = getattr(self, "_routing_generation", 0) + 1
         return self._routing_generation
 
-    def _reconcile_recovered_routing_locked(self) -> None:
+    def _reconcile_recovered_routing_locked(self, routing_db=None) -> None:
         """Merge authoritative rows after a fallback-only startup load."""
         baseline = getattr(self, "_routing_fallback_baseline", None)
         if getattr(self, "_routing_db_loaded", False) or baseline is None:
             return
-        loader = self._routing_db_method("load_gateway_routing_entries")
+        loader = self._routing_db_method("load_gateway_routing_entries", routing_db)
         if loader is None:
             return
         try:
@@ -486,12 +494,14 @@ class SessionPersistenceMixin:
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
 
-    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
+    def _snapshot_routing_locked(self, routing_db=None) -> tuple[Dict[str, Any], int]:
         """Capture immutable routing data and a monotonic generation."""
-        self._reconcile_recovered_routing_locked()
+        self._reconcile_recovered_routing_locked(routing_db)
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self, data: Dict[str, Any], generation: int, routing_db=None,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         with self._lazy("_save_lock", threading.Lock):
             if generation <= getattr(self, "_persisted_routing_generation", 0):
@@ -504,7 +514,7 @@ class SessionPersistenceMixin:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
-            replacer = self._routing_db_method("replace_gateway_routing_entries")
+            replacer = self._routing_db_method("replace_gateway_routing_entries", routing_db)
             if replacer is not None:
                 try:
                     replacer({k: json.dumps(v) for k, v in data.items()}, scope=self._routing_scope())
