@@ -115,7 +115,10 @@ class SessionPersistenceMixin:
             from gateway.shutdown_flush import recover_pending_to_db
             token = set_hermes_home_override(str(path.parent))
             try:
-                recovered = recover_pending_to_db(handle)
+                reconciled = self._reconcile_bootstrap_transcript_fallback(
+                    path.parent, handle
+                )
+                recovered = recover_pending_to_db(handle) if reconciled else 0
             finally:
                 reset_hermes_home_override(token)
             if recovered:
@@ -247,6 +250,9 @@ class SessionPersistenceMixin:
         if not session_id:
             return self._db
         return self._db_for_key(self._owner_key_for_session_id(session_id))
+
+    def has_prepared_db_for_session(self, session_id: Optional[str]) -> bool:
+        return self._db_for_session_id(session_id) is not None
 
     def close_all_db_handles(self) -> None:
         """Close every SessionDB handle this store opened (one per path). Closing only ``store._db``

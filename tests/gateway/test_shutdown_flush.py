@@ -1,19 +1,24 @@
 """Tests for gateway/shutdown_flush.py — pending message durability (#72680)."""
 
+import itertools
 import json
 import os
 import stat
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.shutdown_flush import (
+    _recover_one_payload,
     _serialise_value,
+    drain_transcript_spool,
     flush_overflow_to_file,
     flush_pending_to_file,
     recover_pending_to_db,
+    spool_dropped_transcript_message,
 )
 
 
@@ -96,6 +101,300 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
         timestamp=ts,
     )
     assert not flush_file.exists()
+
+
+def test_recover_transcript_spool_preserves_metadata_and_deduplicates_owner(
+    tmp_path, monkeypatch,
+):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    class _DB:
+        def __init__(self):
+            self.calls = []
+            self.owners = set()
+
+        def get_compression_tip(self, session_id):
+            return session_id
+
+        def has_gateway_input_owner(self, session_id, owner):
+            return (session_id, owner) in self.owners
+
+        def get_session(self, session_id):
+            return None
+
+        def _is_compression_child_row(self, row):
+            return False
+
+        def append_message(self, **kwargs):
+            self.calls.append(kwargs)
+            owner = (kwargs.get("display_metadata") or {}).get("gateway_input_owner")
+            if owner:
+                self.owners.add((kwargs["session_id"], owner))
+
+    message = {
+        "role": "user",
+        "content": "preserve me",
+        "message_id": "platform-1",
+        "observed": True,
+        "timestamp": 123.5,
+        "api_content": "exact bytes",
+        "display_kind": "internal_notification",
+        "display_metadata": {"gateway_input_owner": "owner-1", "user_id": "user-1"},
+    }
+    assert spool_dropped_transcript_message("session-1", message) is not None
+    db = _DB()
+    assert recover_pending_to_db(db) == 1
+    assert db.calls[0]["platform_message_id"] == "platform-1"
+    assert db.calls[0]["observed"] is True
+    assert db.calls[0]["api_content"] == "exact bytes"
+    assert db.calls[0]["display_kind"] == "internal_notification"
+    assert db.calls[0]["display_metadata"] == message["display_metadata"]
+
+    assert spool_dropped_transcript_message("session-1", message) is not None
+    assert recover_pending_to_db(db) == 1
+    assert len(db.calls) == 1
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def test_recover_transcript_spool_uses_logical_order_not_filename(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+
+    def _payload(seq, content, message_id, metadata):
+        return {
+            "session_key": "session-1",
+            "reason": "transcript_cap_drop",
+            "ts": 100,
+            "seq": seq,
+            "data": {
+                "session_id": "session-1",
+                "message": {
+                    "role": "user",
+                    "content": content,
+                    "message_id": message_id,
+                    "display_metadata": metadata,
+                },
+            },
+        }
+
+    (flush_dir / "a-logical-second.json").write_text(
+        json.dumps(_payload(2, "second", "platform-2", {"user_id": "user-2"})),
+        encoding="utf-8",
+    )
+    (flush_dir / "z-logical-first.json").write_text(
+        json.dumps(_payload(1, "first", "platform-1", {"user_id": "user-1"})),
+        encoding="utf-8",
+    )
+
+    db = MagicMock()
+    assert recover_pending_to_db(db) == 2
+    calls = [call.kwargs for call in db.append_message.call_args_list]
+    assert [call["content"] for call in calls] == ["first", "second"]
+    assert [call["platform_message_id"] for call in calls] == ["platform-1", "platform-2"]
+    assert [call["display_metadata"] for call in calls] == [
+        {"user_id": "user-1"},
+        {"user_id": "user-2"},
+    ]
+    assert list(flush_dir.glob("*.json")) == []
+
+
+def _crash_replay_message(role):
+    common = {
+        "role": role,
+        "content": f"{role} durable content",
+        "platform_message_id": f"platform-{role}",
+        "observed": True,
+        "timestamp": 123.5,
+        "api_content": f"{role} exact api content",
+        "display_kind": "spool_test",
+        "display_metadata": {"marker": role, "nested": {"preserved": True}},
+    }
+    if role == "assistant":
+        common.update({
+            "reasoning": "assistant reasoning",
+            "reasoning_details": [{"type": "summary", "text": "detail"}],
+            "codex_message_items": [{"type": "message", "id": "message-1"}],
+        })
+    else:
+        common.update({"tool_name": "lookup", "tool_call_id": "call-1"})
+    return common
+
+
+def _write_crash_replay_spool(flush_dir, role, *, legacy):
+    message = _crash_replay_message(role)
+    if not legacy:
+        return spool_dropped_transcript_message("session-1", message)
+    path = flush_dir / f"pending-legacy-{role}.json"
+    path.write_text(json.dumps({
+        "session_key": "session-1",
+        "reason": "transcript_cap_drop",
+        "ts": 100,
+        "seq": 1,
+        "data": {"session_id": "session-1", "message": message},
+    }), encoding="utf-8")
+    return path
+
+
+def _assert_crash_replay_row(row, role):
+    assert row["role"] == role
+    assert row["content"] == f"{role} durable content"
+    assert row["platform_message_id"] == f"platform-{role}"
+    assert row["observed"] == 1
+    assert row["api_content"] == f"{role} exact api content"
+    assert row["display_kind"] == "spool_test"
+    assert row["display_metadata"]["marker"] == role
+    assert row["display_metadata"]["nested"] == {"preserved": True}
+    assert "_hermes_spool_record_id" not in row["display_metadata"]
+    if role == "assistant":
+        assert row["reasoning"] == "assistant reasoning"
+        assert json.loads(row["reasoning_details"]) == [
+            {"type": "summary", "text": "detail"},
+        ]
+        assert json.loads(row["codex_message_items"]) == [
+            {"type": "message", "id": "message-1"},
+        ]
+    else:
+        assert row["tool_name"] == "lookup"
+        assert row["tool_call_id"] == "call-1"
+
+
+def _assert_crash_replay_conversation(db, role):
+    row = db.get_messages_as_conversation("session-1")[0]
+    assert row["display_metadata"] == {
+        "marker": role,
+        "nested": {"preserved": True},
+    }
+
+
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["new", "legacy"])
+def test_live_drain_is_idempotent_after_commit_before_unlink_crash(
+    role, legacy, tmp_path, monkeypatch,
+):
+    import hermes_state
+    from gateway.session import SessionStore
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("session-1", source="test")
+    store = object.__new__(SessionStore)
+    path = _write_crash_replay_spool(flush_dir, role, legacy=legacy)
+    assert path is not None
+
+    def _commit_then_crash(message, record_id):
+        store._append_transcript_message_to_db(
+            db, "session-1", message, spool_record_id=record_id,
+        )
+        raise RuntimeError("simulated crash after commit")
+
+    assert drain_transcript_spool(
+        "session-1", _commit_then_crash, include_record_id=True,
+    ) == (0, 1)
+    assert path.exists()
+    assert len(db.get_messages("session-1")) == 1
+
+    assert drain_transcript_spool(
+        "session-1",
+        lambda message, record_id: store._append_transcript_message_to_db(
+            db, "session-1", message, spool_record_id=record_id,
+        ),
+        include_record_id=True,
+    ) == (1, 0)
+    rows = db.get_messages("session-1")
+    assert len(rows) == 1
+    _assert_crash_replay_row(rows[0], role)
+    _assert_crash_replay_conversation(db, role)
+    assert not path.exists()
+    db.close()
+
+
+@pytest.mark.parametrize("role", ["assistant", "tool"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["new", "legacy"])
+def test_restart_recovery_is_idempotent_after_commit_before_unlink_crash(
+    role, legacy, tmp_path, monkeypatch,
+):
+    import hermes_state
+
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    db_path = tmp_path / "state.db"
+    first_process = hermes_state.SessionDB(db_path=db_path)
+    first_process.create_session("session-1", source="test")
+    path = _write_crash_replay_spool(flush_dir, role, legacy=legacy)
+    assert path is not None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert _recover_one_payload(first_process, path, payload) is True
+    first_process.close()
+    assert path.exists()
+
+    restarted_process = hermes_state.SessionDB(db_path=db_path)
+    assert recover_pending_to_db(restarted_process) == 1
+    rows = restarted_process.get_messages("session-1")
+    assert len(rows) == 1
+    _assert_crash_replay_row(rows[0], role)
+    _assert_crash_replay_conversation(restarted_process, role)
+    assert not path.exists()
+    restarted_process.close()
+
+
+def test_spool_identity_is_scoped_to_each_profile_database(tmp_path):
+    import hermes_state
+
+    payload = {
+        "session_key": "session-1",
+        "reason": "transcript_cap_drop",
+        "spool_record_id": "shared-record-id",
+        "data": {
+            "session_id": "session-1",
+            "message": {"role": "assistant", "content": "one per profile"},
+        },
+    }
+    for profile in ("profile-a", "profile-b"):
+        db = hermes_state.SessionDB(db_path=tmp_path / profile / "state.db")
+        db.create_session("session-1", source="test")
+        assert _recover_one_payload(db, tmp_path / "spool.json", payload) is True
+        assert _recover_one_payload(db, tmp_path / "spool.json", payload) is True
+        assert len(db.get_messages("session-1")) == 1
+        db.close()
+
+
+def test_recover_transcript_spool_order_survives_process_restart(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    monkeypatch.setattr("gateway.shutdown_flush.time.time", lambda: 100)
+    names = iter(("f" * 32, "0" * 32))
+    monkeypatch.setattr(
+        "gateway.shutdown_flush.uuid.uuid4",
+        lambda: SimpleNamespace(hex=next(names)),
+    )
+
+    first = {
+        "role": "user",
+        "content": "accepted first",
+        "message_id": "platform-1",
+        "display_metadata": {"user_id": "user-1"},
+    }
+    second = {
+        "role": "user",
+        "content": "accepted second",
+        "message_id": "platform-2",
+        "display_metadata": {"user_id": "user-2"},
+    }
+    assert spool_dropped_transcript_message("session-1", first) is not None
+    monkeypatch.setattr("gateway.shutdown_flush._TRANSCRIPT_SPOOL_SEQ", itertools.count())
+    assert spool_dropped_transcript_message("session-1", second) is not None
+
+    db = MagicMock()
+    assert recover_pending_to_db(db) == 2
+    calls = [call.kwargs for call in db.append_message.call_args_list]
+    assert [call["content"] for call in calls] == ["accepted first", "accepted second"]
+    assert [call["platform_message_id"] for call in calls] == ["platform-1", "platform-2"]
+    assert [call["display_metadata"] for call in calls] == [
+        {"user_id": "user-1"},
+        {"user_id": "user-2"},
+    ]
 
 
 def test_recover_closes_owned_db_when_unexpected_exception_escapes(

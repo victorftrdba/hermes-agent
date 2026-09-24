@@ -1,4 +1,4 @@
-import os, sys, json, asyncio, threading, tempfile, sqlite3, socket, subprocess, tracemalloc
+import os, sys, json, asyncio, threading, tempfile, sqlite3, socket, subprocess, tracemalloc, time
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from types import SimpleNamespace
@@ -15,6 +15,7 @@ os.environ.update(
     HERMES_HOME=str(HOME),
     HERMES_DISABLE_PLUGINS="1",
     NO_PROXY="127.0.0.1,localhost",
+    PYTHONPATH=str(ROOT),
 )
 sys.path.insert(0, str(ROOT))
 os.chdir(HOME)
@@ -172,6 +173,12 @@ source = SessionSource(
 runner = GatewayRunner(GatewayConfig())
 runner._recover_telegram_topic_thread_id = lambda source: None
 runner._is_user_authorized = lambda *a: True
+runner.start_session_db_preparation()
+bootstrap_deadline = time.monotonic() + 30
+while runner.session_store._db_for_session_id(None) is None:
+    if time.monotonic() >= bootstrap_deadline:
+        raise RuntimeError("session DB bootstrap did not complete")
+    time.sleep(0.01)
 
 
 def voice_policy(*args, **kwargs):
@@ -358,5 +365,7 @@ async def main():
 try:
     passed = asyncio.run(main())
 finally:
+    runner.stop_session_db_preparation()
+    runner.session_store.close_all_db_handles()
     server.shutdown()
 sys.exit(0 if passed else 1)

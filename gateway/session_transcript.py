@@ -8,6 +8,7 @@ import contextlib
 import logging
 import threading
 from agent.turn_context import extract_api_content_sidecar
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -108,10 +109,41 @@ class SessionTranscriptMixin:
 
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Serialize transcript draining across queue migration boundaries."""
-        if not self._db_for_session_id(session_id) or skip_db:
+        if skip_db:
             return
         with self._get_transcript_drain_lock():
-            self._append_to_transcript_serialized(self._follow_reroutes(session_id), message)
+            session_id = self._follow_reroutes(session_id)
+            db = self._db_for_session_id(session_id)
+            bootstrap_spools = self._lazy("_bootstrap_spooled_transcripts", dict)
+            bootstrap_home = next((
+                home for home, session_ids in bootstrap_spools.items()
+                if session_id in session_ids
+            ), None)
+            if db is not None and bootstrap_home is not None:
+                if not self._reconcile_bootstrap_transcript_fallback(bootstrap_home, db):
+                    db = None
+            if db is None:
+                with self._transcript_retry_lock:
+                    pending = self._dirty_transcripts.setdefault(session_id, [])
+                    pending.append(dict(message))
+                    if len(pending) > self._MAX_PENDING_PER_SESSION:
+                        pending.pop(0)
+                spool_path = _spool_dropped(session_id, message)
+                if spool_path is None:
+                    logger.warning(
+                        "Session DB unavailable for %s and durable transcript fallback failed",
+                        session_id,
+                    )
+                else:
+                    home = spool_path.parent.parent.resolve()
+                    self._lazy("_bootstrap_spooled_transcripts", dict).setdefault(
+                        home, set()
+                    ).add(session_id)
+                    db = self._db_for_session_id(session_id)
+                    if db is not None:
+                        self._reconcile_bootstrap_transcript_fallback(home, db)
+                return
+            self._append_to_transcript_serialized(session_id, message)
 
     def _follow_reroutes(self, session_id: str) -> str:
         """Follow the compression reroute chain (cycle-guarded)."""
@@ -318,23 +350,41 @@ class SessionTranscriptMixin:
         try:
             from gateway.shutdown_flush import drain_transcript_spool
             _replayed, remaining = drain_transcript_spool(
-                session_id, lambda message: self._append_transcript_message(session_id, message),
+                session_id,
+                lambda message, record_id: self._append_transcript_message(
+                    session_id, message, spool_record_id=record_id,
+                ),
+                include_record_id=True,
             )
             if not remaining:
                 spooled_sessions.discard(session_id)
         except Exception as exc:
             logger.warning("Failed to drain transcript spool for %s: %s", session_id, exc)
 
-    def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
+    def _append_transcript_message(
+        self, session_id: str, message: Dict[str, Any],
+        *, spool_record_id: Optional[str] = None,
+    ) -> None:
         """Write one transcript row. Caller handles retry queuing."""
-        _db = self._db_for_session_id(session_id)
-        if _db is None:
+        db = self._db_for_session_id(session_id)
+        if db is None:
             # Named profile with no resolvable home yet: defer (caller queues) instead of writing
             # into the ambient store.
             raise RuntimeError(
                 f"no owning session store for {session_id}; deferring transcript write")
+        self._append_transcript_message_to_db(
+            db, session_id, message, spool_record_id=spool_record_id,
+        )
+
+    def _append_transcript_message_to_db(
+        self, db, session_id: str, message: Dict[str, Any],
+        *, spool_record_id: Optional[str] = None,
+    ) -> None:
         is_assistant = message.get("role") == "assistant"
-        _db.append_message(
+        spool_identity = (
+            {"spool_record_id": spool_record_id} if spool_record_id else {}
+        )
+        db.append_message(
             session_id=session_id,
             role=message.get("role", "unknown"),
             content=message.get("content"),
@@ -353,7 +403,43 @@ class SessionTranscriptMixin:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
+            **spool_identity,
         )
+
+    def _reconcile_bootstrap_transcript_fallback(self, home, db) -> bool:
+        with self._get_transcript_drain_lock():
+            return self._reconcile_bootstrap_transcript_fallback_locked(home, db)
+
+    def _reconcile_bootstrap_transcript_fallback_locked(self, home, db) -> bool:
+        """Drain the exact profile's pending bootstrap writes, then remove their spool copies."""
+        home = Path(home).resolve()
+        session_ids = list(
+            self._lazy("_bootstrap_spooled_transcripts", dict).get(home, set())
+        )
+        if not session_ids:
+            return True
+        from gateway.shutdown_flush import drain_transcript_spool
+
+        for session_id in session_ids:
+            def _replay(message, spool_record_id):
+                owner = (message.get("display_metadata") or {}).get(
+                    "gateway_input_owner"
+                )
+                if not owner or not self._db_has_input_owner(db, session_id, owner):
+                    self._append_transcript_message_to_db(
+                        db, session_id, message, spool_record_id=spool_record_id,
+                    )
+
+            replayed, remaining = drain_transcript_spool(
+                session_id, _replay, include_record_id=True,
+            )
+            if replayed and not remaining:
+                with self._transcript_retry_lock:
+                    self._dirty_transcripts.pop(session_id, None)
+                self._bootstrap_spooled_transcripts.get(home, set()).discard(session_id)
+        if not self._bootstrap_spooled_transcripts.get(home):
+            self._bootstrap_spooled_transcripts.pop(home, None)
+        return home not in self._bootstrap_spooled_transcripts
 
     @staticmethod
     def _is_fts_corruption_error(exc: Exception) -> bool:
@@ -453,6 +539,20 @@ class SessionTranscriptMixin:
             self._clear_dirty_transcript(session_id)
             return True
 
+    @staticmethod
+    def _db_has_input_owner(db, session_id: str, owner: str) -> bool:
+        current = db.get_compression_tip(session_id) or session_id
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            if db.has_gateway_input_owner(current, owner):
+                return True
+            row = db.get_session(current)
+            if not row or not db._is_compression_child_row(row):
+                break
+            current = row["parent_session_id"]
+        return False
+
     def has_input_owner(self, session_id: str, owner: str) -> bool:
         """Find this accepted input on the canonical live continuation and its ancestors.
 
@@ -461,18 +561,18 @@ class SessionTranscriptMixin:
         """
         try:
             current = self._follow_reroutes(session_id)
-            db = self._db_for_session_id(current)
-            current = db.get_compression_tip(current) or current
-            seen = set()
-            while current and current not in seen:
-                seen.add(current)
-                if db.has_gateway_input_owner(current, owner):
+            with self._transcript_retry_lock:
+                if any(
+                    (message.get("display_metadata") or {}).get(
+                        "gateway_input_owner"
+                    ) == owner
+                    for message in self._lazy("_dirty_transcripts", dict).get(current, [])
+                ):
                     return True
-                row = db.get_session(current)
-                if not row or not db._is_compression_child_row(row):
-                    break
-                current = row["parent_session_id"]
-            return False
+            db = self._db_for_session_id(current)
+            if db is None:
+                raise RuntimeError("session database is not prepared")
+            return self._db_has_input_owner(db, current, owner)
         except Exception as e:
             raise TranscriptReadError(session_id) from e
 
@@ -481,7 +581,9 @@ class SessionTranscriptMixin:
         same routing writes use — the in-memory reroute map, then the durable compression tip —
         otherwise the transcript "vanishes" while every message sits under the child."""
         if not self._db_for_session_id(session_id):
-            return []
+            session_id = self._follow_reroutes(session_id)
+            with self._transcript_retry_lock:
+                return [dict(message) for message in self._dirty_transcripts.get(session_id, [])]
         session_id = self._follow_reroutes(session_id)
         with contextlib.suppress(Exception):
             # Durable successor survives restart; the reroute map doesn't.

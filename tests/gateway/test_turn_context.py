@@ -69,7 +69,70 @@ class TestTurnRunner:
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
 
-    def test_normal_response_preserves_compression_exhausted(self):
+    def test_finish_stream_consumer_publishes_construction_time_db_state(self):
+        ctx = TurnContext(result_holder=[None])
+        runner = _make_runner(ctx)
+        runner._agent_session_db_available = True
+        result = {"final_response": "done", "messages": []}
+
+        runner._finish_stream_consumer(result, [], None)
+
+        assert ctx.result_holder[0] is result
+        assert result["agent_session_db_available"] is True
+
+    def test_finish_stream_consumer_accepts_none_result(self):
+        ctx = TurnContext(result_holder=[{}])
+        runner = _make_runner(ctx)
+
+        runner._finish_stream_consumer(None, [], None)
+
+        assert ctx.result_holder[0] is None
+
+    @pytest.mark.parametrize("early_return", ["stale_goal", "empty_followup"])
+    def test_queued_followup_early_return_keeps_published_db_state(self, early_return):
+        from gateway.run import GatewayRunner
+        from gateway.run_turn_runner import TurnRunner
+
+        source = SessionSource(platform=Platform.LOCAL, chat_id="chat", user_id="user")
+        ctx = TurnContext(
+            source=source,
+            session_id="session",
+            session_key="key",
+            run_generation=1,
+            history=[],
+            _interrupt_depth=0,
+            _status_thread_metadata={},
+            result_holder=[None],
+        )
+        gateway_runner = object.__new__(GatewayRunner)
+        gateway_runner._is_goal_continuation_event = lambda event: early_return == "stale_goal"
+        gateway_runner._goal_still_active_for_session = lambda session_id: False
+        gateway_runner._session_key_for_source = lambda next_source: "key"
+
+        async def _prepare(**kwargs):
+            return None
+
+        gateway_runner._prepare_profile_scoped_inbound_message_text = _prepare
+        raw_result = {"final_response": "done", "messages": [], "interrupted": True}
+        turn_runner = TurnRunner(gateway_runner, ctx)
+        turn_runner._agent_session_db_available = False
+        turn_runner._finish_stream_consumer(raw_result, [], None)
+
+        returned = asyncio.run(gateway_runner._run_agent_queued_followup(
+            ctx,
+            MagicMock(),
+            "next",
+            SimpleNamespace(source=source),
+            "done",
+            raw_result,
+            None,
+        ))
+
+        assert returned is raw_result
+        assert returned["agent_session_db_available"] is False
+
+    @pytest.mark.parametrize("session_db_available", [False, True])
+    def test_normal_response_preserves_compression_exhausted(self, session_db_available):
         """A non-empty exhaustion response must still reach auto-reset consumers."""
 
         class _ExhaustedAgent:
@@ -97,7 +160,7 @@ class TestTurnRunner:
         gateway_runner._provider_routing = {}
         gateway_runner._agent_cache_lock = None
         gateway_runner._agent_cache = {}
-        gateway_runner._session_db = None
+        gateway_runner._session_db = object() if session_db_available else None
         gateway_runner._prefill_messages = None
         gateway_runner._pending_model_notes = {}
         gateway_runner._pending_skills_reload_notes = {}
@@ -145,3 +208,5 @@ class TestTurnRunner:
             "Context length exceeded. Cannot compress further."
         )
         assert result["compression_exhausted"] is True
+        assert result["agent_session_db_available"] is session_db_available
+        assert result["agent_persisted"] is session_db_available

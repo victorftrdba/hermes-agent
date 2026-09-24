@@ -303,7 +303,7 @@ async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatch, tmp_path):
+async def test_inject_watch_notification_uses_live_origin_without_loading(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
     runner = _build_runner(monkeypatch, tmp_path, "all")
@@ -338,8 +338,8 @@ async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatc
     )
 
     adapter.handle_message.assert_awaited_once()
-    assert load_threads
-    assert all(thread_id != loop_thread for thread_id in load_threads)
+    assert load_threads == []
+    assert threading.get_ident() == loop_thread
 
 
 @pytest.mark.asyncio

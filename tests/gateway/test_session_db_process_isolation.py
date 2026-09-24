@@ -218,6 +218,133 @@ def test_fallback_routing_reconciles_after_child_success(monkeypatch, tmp_path) 
     store.close_all_db_handles()
 
 
+def test_pending_transcript_spools_and_reconciles_without_metadata_loss(
+    monkeypatch, tmp_path,
+) -> None:
+    import hermes_state
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    db_path = (tmp_path / "state.db").resolve()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    entry = _entry("agent:main:telegram:dm:fallback", "fallback-transcript")
+    database = hermes_state.SessionDB(db_path=db_path)
+    database.create_session(
+        entry.session_id, source="telegram", session_key=entry.session_key,
+    )
+    database.close()
+    process = _Process({"status": "ok", "db_path": str(db_path)}, blocked=True)
+    manager = SessionDBPreparationManager(popen=lambda *a, **k: process)
+    store = SessionStore(
+        sessions_dir, GatewayConfig(sessions_dir=sessions_dir),
+        eager_session_db=False, db_preparation=manager,
+    )
+    store._routing_home = tmp_path
+    store._entries[entry.session_key] = entry
+    store._loaded = True
+    monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+    manager.enable()
+    total = store._MAX_PENDING_PER_SESSION + 5
+    messages = [{
+        "role": "user",
+        "content": f"accepted while bootstrap is pending {index}",
+        "platform_message_id": f"message-{index}",
+        "display_metadata": {"gateway_input_owner": f"owner-{index}"},
+    } for index in range(total)]
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        for message in messages:
+            store.append_to_transcript(entry.session_id, message)
+        assert store.load_transcript(entry.session_id) == messages[-store._MAX_PENDING_PER_SESSION:]
+        assert len(list((tmp_path / "pending_messages").glob("pending-*.json"))) == total
+        process.release.set()
+
+        def _rows():
+            db = store._db_for_session_id(entry.session_id)
+            return db.get_messages(entry.session_id) if db is not None else []
+
+        _wait_until(lambda: len(_rows()) == total)
+        rows = _rows()
+        assert [row["content"] for row in rows] == [message["content"] for message in messages]
+        assert [row["platform_message_id"] for row in rows] == [
+            message["platform_message_id"] for message in messages
+        ]
+        assert [row["display_metadata"] for row in rows] == [
+            message["display_metadata"] for message in messages
+        ]
+        assert list((tmp_path / "pending_messages").glob("pending-*.json")) == []
+        assert store._dirty_transcripts == {}
+    finally:
+        reset_hermes_home_override(token)
+        manager.close()
+        store.close_all_db_handles()
+
+
+def test_partial_bootstrap_reconciliation_retries_on_next_append(tmp_path) -> None:
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    store = SessionStore(
+        sessions_dir, GatewayConfig(sessions_dir=sessions_dir), eager_session_db=False,
+    )
+    entry = _entry("agent:main:telegram:dm:retry", "retry-transcript")
+    store._entries[entry.session_key] = entry
+    store._loaded = True
+    store._db = None
+    old = [{
+        "role": "user",
+        "content": f"old-{index}",
+        "display_metadata": {"gateway_input_owner": f"owner-{index}"},
+    } for index in range(3)]
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        for message in old:
+            store.append_to_transcript(entry.session_id, message)
+
+        class _DB:
+            def __init__(self):
+                self.rows = []
+                self.failed = False
+
+            def get_compression_tip(self, session_id):
+                return session_id
+
+            def has_gateway_input_owner(self, session_id, owner):
+                return any(
+                    row["session_id"] == session_id
+                    and (row.get("display_metadata") or {}).get("gateway_input_owner") == owner
+                    for row in self.rows
+                )
+
+            def get_session(self, session_id):
+                return None
+
+            def _is_compression_child_row(self, row):
+                return False
+
+            def append_message(self, **kwargs):
+                if kwargs["content"] == "old-1" and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("transient write failure")
+                self.rows.append(kwargs)
+
+        db = _DB()
+        store._db = db
+        assert store._reconcile_bootstrap_transcript_fallback(tmp_path, db) is False
+        assert [row["content"] for row in db.rows] == ["old-0"]
+        assert len(list((tmp_path / "pending_messages").glob("pending-*.json"))) == 2
+
+        store.append_to_transcript(entry.session_id, {"role": "user", "content": "new"})
+
+        assert [row["content"] for row in db.rows] == ["old-0", "old-1", "old-2", "new"]
+        assert list((tmp_path / "pending_messages").glob("pending-*.json")) == []
+        assert store._dirty_transcripts == {}
+    finally:
+        reset_hermes_home_override(token)
+        store.close_all_db_handles()
+
+
 def test_failed_child_retries_after_backoff(tmp_path) -> None:
     clock = _Clock()
     db_path = (tmp_path / "state.db").resolve()
@@ -627,3 +754,217 @@ def test_lifecycle_and_housekeeping_sqlite_work_is_child_owned(monkeypatch, tmp_
         gateway_run._housekeeping_auto_archive(_Runner())
         gateway_run._housekeeping_deferred_fts_retry(_Runner())
     assert [name for name, _ in calls[-2:]] == ["requested", "requested"]
+
+
+def test_agent_persisted_gate_uses_exact_secondary_session_handle(monkeypatch) -> None:
+    import gateway.run as gateway_run
+
+    calls = []
+    backing_store = object()
+
+    class _AsyncStore:
+        _store = backing_store
+
+        async def has_prepared_db_for_session(self, session_id):
+            calls.append(("ready", session_id))
+            return True
+
+        async def append_to_transcript(self, session_id, message, **kwargs):
+            calls.append((message["role"], session_id, kwargs.get("skip_db", False)))
+
+        async def update_session(self, *args, **kwargs):
+            return None
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = backing_store
+    runner._async_session_store = _AsyncStore()
+    runner._session_db = None
+
+    async def _refresh(*args):
+        return None
+
+    runner._refresh_agent_cache_message_count = _refresh
+    entry = _entry("agent:secondary:telegram:dm:chat:user", "secondary-session")
+    prepared = SimpleNamespace(
+        history=[], persist_user_message="hello", message_text="hello",
+        persist_user_timestamp=1.0, persist_user_display_kind=None,
+        persistence_owner="owner", persistence_session_id=entry.session_id,
+    )
+    event = SimpleNamespace(message_id="message-1", internal=False)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "fixture")
+
+    asyncio.run(runner._hmwa_persist_turn_transcript(
+        event=event,
+        source=entry.origin,
+        session_entry=entry,
+        session_key=entry.session_key,
+        agent_result={"agent_persisted": True, "history_offset": 0},
+        agent_messages=[{"role": "user", "content": "hello"}],
+        prepared=prepared,
+        response="",
+        agent_failed_early=False,
+        hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    ))
+
+    assert calls[0] == ("ready", "secondary-session")
+    assert ("user", "secondary-session", True) in calls
+
+
+@pytest.mark.parametrize(
+    ("agent_session_db_available", "expected_skip_db"),
+    [(False, False), (True, True)],
+    ids=["pending_then_attached", "constructed_ready"],
+)
+def test_mid_turn_attach_uses_agent_construction_time_for_persistence(
+    monkeypatch, agent_session_db_available, expected_skip_db,
+) -> None:
+    import gateway.run as gateway_run
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    calls = []
+    backing_store = object()
+
+    class _AsyncStore:
+        _store = backing_store
+
+        async def has_prepared_db_for_session(self, session_id):
+            calls.append(("ready", session_id))
+            return True
+
+        async def append_to_transcript(self, session_id, message, **kwargs):
+            calls.append((message["role"], session_id, kwargs.get("skip_db", False)))
+
+        async def update_session(self, *args, **kwargs):
+            return None
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = backing_store
+    runner._async_session_store = _AsyncStore()
+
+    async def _refresh(*args):
+        return None
+
+    runner._refresh_agent_cache_message_count = _refresh
+    entry = _entry("agent:secondary:telegram:dm:chat:user", "secondary-session")
+    prepared = SimpleNamespace(
+        history=[], persist_user_message="hello", message_text="hello",
+        persist_user_timestamp=1.0, persist_user_display_kind=None,
+        persistence_owner="owner", persistence_session_id=entry.session_id,
+    )
+    event = SimpleNamespace(message_id="message-1", internal=False)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "fixture")
+    agent_result = {
+        "agent_session_db_available": agent_session_db_available,
+        "history_offset": 0,
+    }
+    if not agent_session_db_available:
+        queued = []
+        adapter = SimpleNamespace(queue_message=lambda key, message: queued.append((key, message)))
+        runner._adapter_for_source = lambda source: adapter
+        turn_ctx = TurnContext(
+            source=entry.origin,
+            session_id=entry.session_id,
+            session_key=entry.session_key,
+            run_generation=1,
+            history=[],
+            _interrupt_depth=runner._MAX_INTERRUPT_DEPTH,
+            _status_thread_metadata={},
+            result_holder=[None],
+        )
+        raw_result = {"final_response": "", "messages": [], "history_offset": 0}
+        turn_runner = TurnRunner(runner, turn_ctx)
+        turn_runner._agent_session_db_available = False
+        turn_runner._finish_stream_consumer(raw_result, [], None)
+        agent_result = asyncio.run(runner._run_agent_queued_followup(
+            turn_ctx, adapter, "queued", None, "", raw_result, None,
+        ))
+        assert queued == [(entry.session_key, "queued")]
+
+    asyncio.run(runner._hmwa_persist_turn_transcript(
+        event=event,
+        source=entry.origin,
+        session_entry=entry,
+        session_key=entry.session_key,
+        agent_result=agent_result,
+        agent_messages=[{"role": "user", "content": "hello"}],
+        prepared=prepared,
+        response="",
+        agent_failed_early=False,
+        hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    ))
+
+    user_calls = [call for call in calls if call[0] == "user"]
+    assert user_calls == [("user", "secondary-session", expected_skip_db)]
+
+
+@pytest.mark.parametrize(
+    ("agent_session_db_available", "prepared_db_available"),
+    [(False, True), (True, False)],
+    ids=["pending_then_attached", "ready_then_unavailable"],
+)
+def test_unavailable_db_rejects_codex_persisted_claim(
+    monkeypatch, agent_session_db_available, prepared_db_available,
+) -> None:
+    import gateway.run as gateway_run
+
+    calls = []
+    backing_store = object()
+
+    class _AsyncStore:
+        _store = backing_store
+
+        async def has_prepared_db_for_session(self, session_id):
+            return prepared_db_available
+
+        async def append_to_transcript(self, session_id, message, **kwargs):
+            calls.append((message["role"], session_id, kwargs.get("skip_db", False)))
+
+        async def update_session(self, *args, **kwargs):
+            return None
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.session_store = backing_store
+    runner._async_session_store = _AsyncStore()
+
+    async def _refresh(*args):
+        return None
+
+    runner._refresh_agent_cache_message_count = _refresh
+    entry = _entry("agent:secondary:telegram:dm:chat:user", "secondary-session")
+    prepared = SimpleNamespace(
+        history=[], persist_user_message="hello", message_text="hello",
+        persist_user_timestamp=1.0, persist_user_display_kind=None,
+        persistence_owner="owner", persistence_session_id=entry.session_id,
+    )
+    event = SimpleNamespace(message_id="message-1", internal=False)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "fixture")
+
+    asyncio.run(runner._hmwa_persist_turn_transcript(
+        event=event,
+        source=entry.origin,
+        session_entry=entry,
+        session_key=entry.session_key,
+        agent_result={
+            "agent_session_db_available": agent_session_db_available,
+            "agent_persisted": True,
+            "history_offset": 0,
+        },
+        agent_messages=[
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ],
+        prepared=prepared,
+        response="hi",
+        agent_failed_early=False,
+        hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    ))
+
+    transcript_calls = [call for call in calls if call[0] in {"user", "assistant"}]
+    assert transcript_calls == [
+        ("user", "secondary-session", False),
+        ("assistant", "secondary-session", False),
+    ]

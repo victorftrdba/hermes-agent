@@ -27,8 +27,13 @@ logger = logging.getLogger(__name__)
 # operation. Payloads carry the full transcript message dict for verbatim replay.
 # See #78182.
 TRANSCRIPT_CAP_DROP_REASON = "transcript_cap_drop"
-# Monotonic tiebreaker so same-second spool files replay in drop order.
+# Legacy same-process tiebreaker retained for records without a durable order key.
 _TRANSCRIPT_SPOOL_SEQ = itertools.count()
+_TRANSCRIPT_SPOOL_ORDER_FILE = ".transcript-spool-order"
+_TRANSCRIPT_SPOOL_LOCK_FILE = ".transcript-spool-order.lock"
+_TRANSCRIPT_SPOOL_LOCK_TIMEOUT_SECONDS = 5.0
+_TRANSCRIPT_SPOOL_ID_PREFIX = "spool-v1:"
+_LEGACY_TRANSCRIPT_SPOOL_ID_PREFIX = "legacy-file-v1:"
 
 
 def _get_flush_dir():
@@ -41,10 +46,12 @@ def _get_flush_dir():
     return flush_dir
 
 
-def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
+def _write_payload(
+    flush_dir: Path, payload: Dict[str, Any], *, record_id: Optional[str] = None,
+) -> Path:
     """Atomically write one private, uniquely named recovery payload; return its path."""
     from utils import atomic_json_write
-    final_path = flush_dir / f"pending-{uuid.uuid4().hex}.json"
+    final_path = flush_dir / f"pending-{record_id or uuid.uuid4().hex}.json"
     atomic_json_write(final_path, payload, mode=0o600, default=str)
     if os.name == "posix":
         # Persist the directory entry too; keep the published file (the only recovery copy) even if
@@ -74,6 +81,48 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
     except Exception as exc:
         logger.debug("Failed to flush %s message for %s: %s", kind, session_key, exc)
         return False
+
+
+def _next_transcript_spool_order(flush_dir: Path) -> int:
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+    from utils import atomic_json_write
+
+    lock_path = flush_dir / _TRANSCRIPT_SPOOL_LOCK_FILE
+    handle = open(lock_path, "a+", encoding="utf-8")
+    acquired = False
+    try:
+        deadline = time.monotonic() + _TRANSCRIPT_SPOOL_LOCK_TIMEOUT_SECONDS
+        while not (acquired := _try_acquire_file_lock(handle)):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring transcript spool order lock {lock_path}")
+            time.sleep(0.01)
+        order_path = flush_dir / _TRANSCRIPT_SPOOL_ORDER_FILE
+        try:
+            state = json.loads(order_path.read_text(encoding="utf-8"))
+            last_order = int(state.get("last_order", 0))
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            last_order = 0
+        next_order = last_order + 1
+        atomic_json_write(order_path, {"last_order": next_order}, mode=0o600)
+        return next_order
+    finally:
+        if acquired:
+            _release_file_lock(handle)
+        handle.close()
+
+
+def _transcript_spool_sort_key(payload: Dict[str, Any], path: Path) -> tuple:
+    durable_order = payload.get("spool_order")
+    if isinstance(durable_order, int) and not isinstance(durable_order, bool):
+        return 1, durable_order, 0, path.name
+    return 0, payload.get("ts", 0), payload.get("seq", 0), path.name
+
+
+def _transcript_spool_record_id(payload: Dict[str, Any], path: Path) -> str:
+    record_id = payload.get("spool_record_id")
+    if isinstance(record_id, str) and record_id:
+        return record_id
+    return f"{_LEGACY_TRANSCRIPT_SPOOL_ID_PREFIX}{path.name}"
 
 
 def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
@@ -120,21 +169,29 @@ def spool_dropped_transcript_message(session_id: str, message: Dict[str, Any]) -
     discards user data while the process stays up (#78182).
     """
     try:
-        return _write_payload(_get_flush_dir(), {
+        flush_dir = _get_flush_dir()
+        spool_order = _next_transcript_spool_order(flush_dir)
+        record_token = uuid.uuid4().hex
+        spool_record_id = f"{_TRANSCRIPT_SPOOL_ID_PREFIX}{record_token}"
+        return _write_payload(flush_dir, {
             "session_key": session_id, "reason": TRANSCRIPT_CAP_DROP_REASON, "ts": int(time.time()),
-            "seq": next(_TRANSCRIPT_SPOOL_SEQ),
+            "seq": next(_TRANSCRIPT_SPOOL_SEQ), "spool_order": spool_order,
+            "spool_record_id": spool_record_id,
             "data": {"session_id": session_id, "message": message},
-        })
+        }, record_id=record_token)
     except Exception as exc:
         logger.debug("Failed to spool cap-dropped transcript message for %s: %s", session_id, exc)
         return None
 
 
-def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
+def drain_transcript_spool(
+    session_id: str, replay, *, include_record_id: bool = False,
+) -> tuple[int, int]:
     """Replay cap-dropped transcript messages spooled for *session_id*; return ``(replayed,
     remaining)``. ``replay(message_dict)`` runs per message in drop order; a spool file is deleted
     only after its replay succeeds. The first failure stops the drain (the DB is likely still
-    unhealthy) and keeps the rest for retry.
+    unhealthy) and keeps the rest for retry. With ``include_record_id``, replay receives the stable
+    spool identity as its second argument.
     """
     try:
         candidates = list(_get_flush_dir().glob("pending-*.json"))
@@ -155,11 +212,15 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
             logger.warning("Removing structurally invalid transcript spool file %s", path)
             path.unlink(missing_ok=True)
             continue
-        entries.append((payload.get("ts", 0), payload.get("seq", 0), path.name, path, message))
-    ordered, replayed, remaining = sorted(entries, key=lambda e: e[:3]), 0, 0
-    for idx, (_ts, _seq, _name, path, message) in enumerate(ordered):
+        record_id = _transcript_spool_record_id(payload, path)
+        entries.append((_transcript_spool_sort_key(payload, path), path, message, record_id))
+    ordered, replayed, remaining = sorted(entries, key=lambda entry: entry[0]), 0, 0
+    for idx, (_order, path, message, record_id) in enumerate(ordered):
         try:
-            replay(message)
+            if include_record_id:
+                replay(message, record_id)
+            else:
+                replay(message)
         except Exception as exc:
             logger.warning("Replay of spooled transcript message %s for %s failed; "
                            "keeping spool file for retry: %s", path, session_id, exc)
@@ -207,6 +268,23 @@ def recover_pending_to_db(session_db=None) -> int:
     flush_files = sorted(_get_flush_dir().glob("*.json"))
     if not flush_files:
         return 0
+    transcript_files = []
+    for path in flush_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
+            transcript_files.append((_transcript_spool_sort_key(payload, path), path))
+    if transcript_files:
+        ordered_transcript_paths = iter(
+            entry[-1] for entry in sorted(transcript_files, key=lambda entry: entry[0])
+        )
+        transcript_paths = {entry[-1] for entry in transcript_files}
+        flush_files = [
+            next(ordered_transcript_paths) if path in transcript_paths else path
+            for path in flush_files
+        ]
     own_db = session_db is None
     if own_db:
         from hermes_state_registry import acquire
@@ -243,9 +321,48 @@ def _recover_one_payload(session_db, path: Path, payload: Dict[str, Any]) -> boo
             logger.warning("Cannot recover structurally invalid transcript spool "
                            "file %s; preserved for manual inspection", path)
             return False
-        session_db.append_message(session_id=spooled_sid, role=message.get("role", "unknown"),
-                                  content=message.get("content") or "",
-                                  timestamp=message.get("timestamp") or payload.get("ts"))
+        metadata = message.get("display_metadata") or {}
+        owner = metadata.get("gateway_input_owner") if isinstance(metadata, dict) else None
+        if owner:
+            current = session_db.get_compression_tip(spooled_sid) or spooled_sid
+            seen = set()
+            while current and current not in seen:
+                seen.add(current)
+                if session_db.has_gateway_input_owner(current, owner):
+                    return True
+                row = session_db.get_session(current)
+                if not row or not session_db._is_compression_child_row(row):
+                    break
+                current = row["parent_session_id"]
+        from agent.turn_context import extract_api_content_sidecar
+        is_assistant = message.get("role") == "assistant"
+        spool_record_id = _transcript_spool_record_id(payload, path)
+        session_db.append_message(
+            session_id=spooled_sid,
+            role=message.get("role", "unknown"),
+            content=message.get("content"),
+            tool_name=message.get("tool_name"),
+            tool_calls=message.get("tool_calls"),
+            tool_call_id=message.get("tool_call_id"),
+            **{
+                key: message.get(key) if is_assistant else None
+                for key in (
+                    "reasoning", "reasoning_content", "reasoning_details",
+                    "codex_reasoning_items", "codex_message_items",
+                )
+            },
+            platform_message_id=(
+                message.get("platform_message_id") or message.get("message_id")
+            ),
+            observed=bool(message.get("observed")),
+            timestamp=(
+                message["timestamp"] if "timestamp" in message else payload.get("ts")
+            ),
+            api_content=extract_api_content_sidecar(message),
+            display_kind=message.get("display_kind"),
+            display_metadata=message.get("display_metadata"),
+            spool_record_id=spool_record_id,
+        )
         return True
     session_key, data = payload.get("session_key", ""), payload.get("data", {})
     text = data.get("text", "")

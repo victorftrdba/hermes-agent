@@ -7,7 +7,15 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
-from gateway.session_db_recovery import RecoverableHandleCache
+from gateway.session_db_recovery import (
+    RecoverableHandleCache,
+    SessionDBPreparationManager,
+    _deregister_health_source,
+    _HealthSource,
+    _health_aggregate_locked,
+    _health_lock,
+    _publish_health,
+)
 
 
 class _Clock:
@@ -104,6 +112,82 @@ def test_runtime_health_is_sanitized_and_recovers() -> None:
     serialized = repr(writes)
     assert "secret/profile" not in serialized
     assert "malformed" not in serialized
+
+
+def test_closed_preparation_manager_does_not_poison_recovered_cache_health(tmp_path) -> None:
+    writes: list[dict] = []
+
+    def unavailable_child(*_args, **_kwargs):
+        raise OSError("bootstrap unavailable")
+
+    clock = _Clock()
+    manager = SessionDBPreparationManager(popen=unavailable_child)
+    cache = RecoverableHandleCache(clock=clock, initial_retry_delay=1)
+    calls = 0
+
+    def opener():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("cache unavailable")
+        return object()
+
+    with patch("gateway.status.write_runtime_status", side_effect=lambda **kw: writes.append(kw)):
+        manager.enable()
+        assert manager.request(
+            tmp_path / "state.db",
+            profile_home=tmp_path,
+            sessions_dir=tmp_path / "sessions",
+        ) == "failed"
+        assert writes[-1] == {"session_store": {"status": "unavailable"}}
+        manager.close()
+        assert writes[-1] == {"session_store": {"status": "ok"}}
+
+        assert cache.get(tmp_path / "later.db", opener) is None
+        clock.now = 1.0
+        assert cache.get(tmp_path / "later.db", opener) is not None
+        assert writes[-1] == {"session_store": {"status": "ok"}}
+        cache.close_all(lambda _handle: None)
+
+
+def test_delayed_health_write_rechecks_revision_before_returning(tmp_path) -> None:
+    stale_source = _HealthSource()
+    unavailable_source = _HealthSource()
+    delayed_ok_started = threading.Event()
+    release_delayed_ok = threading.Event()
+    writes: list[str] = []
+    delayed_once = False
+
+    def writer(**kwargs):
+        nonlocal delayed_once
+        status = kwargs["session_store"]["status"]
+        if status == "ok" and not delayed_once:
+            delayed_once = True
+            delayed_ok_started.set()
+            assert release_delayed_ok.wait(timeout=5)
+        writes.append(status)
+
+    with _health_lock:
+        assert _health_aggregate_locked() == "ok"
+    with patch("gateway.status.write_runtime_status", side_effect=writer):
+        _publish_health(stale_source, tmp_path / "stale.db", "unavailable")
+        delayed = threading.Thread(
+            target=_deregister_health_source,
+            args=(stale_source,),
+        )
+        delayed.start()
+        assert delayed_ok_started.wait(timeout=5)
+        _publish_health(
+            unavailable_source, tmp_path / "current.db", "unavailable",
+        )
+        release_delayed_ok.set()
+        delayed.join(timeout=5)
+        assert not delayed.is_alive()
+        with _health_lock:
+            current = _health_aggregate_locked()
+        assert current == "unavailable"
+        assert writes[-1] == current
+        _deregister_health_source(unavailable_source)
 
 
 def test_session_store_and_runner_reopen_after_failed_construction(monkeypatch, tmp_path) -> None:

@@ -31,19 +31,48 @@ class _HealthSource:
 _health_lock = threading.Lock()
 _health_states: weakref.WeakKeyDictionary[_HealthSource, dict[Path, str]]
 _health_states = weakref.WeakKeyDictionary()
+_health_revision = 0
 
 
-def _publish_health(source: _HealthSource, path: Path, state: str) -> None:
-    """Publish one privacy-safe aggregate (no paths, no errors) across all live caches."""
-    with _health_lock:
-        _health_states.setdefault(source, {})[path] = state
-        all_states = {value for item in _health_states.values() for value in item.values()}
-        aggregate = next((s for s in ("retrying", "unavailable") if s in all_states), "ok")
+def _health_aggregate_locked() -> str:
+    all_states = {value for item in _health_states.values() for value in item.values()}
+    return next((state for state in ("retrying", "unavailable") if state in all_states), "ok")
+
+
+def _write_health_aggregate(aggregate: str) -> None:
     try:
         from gateway.status import write_runtime_status
         write_runtime_status(session_store={"status": aggregate})
     except Exception:
-        pass  # Runtime health is diagnostic only; persistence must not depend on it.
+        pass
+
+
+def _publish_current_health() -> None:
+    while True:
+        with _health_lock:
+            aggregate = _health_aggregate_locked()
+            revision = _health_revision
+        _write_health_aggregate(aggregate)
+        with _health_lock:
+            if revision == _health_revision:
+                return
+
+
+def _publish_health(source: _HealthSource, path: Path, state: str) -> None:
+    """Publish one privacy-safe aggregate (no paths, no errors) across all live caches."""
+    global _health_revision
+    with _health_lock:
+        _health_states.setdefault(source, {})[path] = state
+        _health_revision += 1
+    _publish_current_health()
+
+
+def _deregister_health_source(source: _HealthSource) -> None:
+    global _health_revision
+    with _health_lock:
+        _health_states.pop(source, None)
+        _health_revision += 1
+    _publish_current_health()
 
 
 class RecoverableHandleCache:
@@ -137,16 +166,12 @@ class RecoverableHandleCache:
             self._generation += 1
             self._close_rejected = close
             handles = list(self.handles.values())
-            paths = set(self.handles) | set(self._unavailable)
             self.handles.clear()
             self._unavailable.clear()
         for handle in handles:
             with contextlib.suppress(Exception):
                 close(handle)
-        with _health_lock:
-            states = _health_states.get(self._health_source, {})
-            for path in paths:
-                states.pop(path, None)
+        _deregister_health_source(self._health_source)
 
 
 @dataclass
@@ -431,6 +456,7 @@ class SessionDBPreparationManager:
                     process.wait(timeout=0.5)
             if watcher is not None and watcher is not threading.current_thread():
                 watcher.join(timeout=max(0.0, deadline - self._clock()))
+        _deregister_health_source(self._health_source)
 
 
 def configured_settings(config: dict[str, Any]) -> dict[str, Any]:
