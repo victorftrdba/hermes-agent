@@ -1,6 +1,7 @@
 """Tests for lazy forum command registration in TelegramAdapter."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -83,3 +84,44 @@ async def test_ensure_forum_commands_race_safety():
 
     # The lock should make this exactly 1 call, not 2.
     assert adapter._bot.set_my_commands.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_forum_commands_scan_does_not_block_event_loop():
+    adapter = _make_test_adapter()
+    msg = _forum_message(chat_id=-456, is_forum=True)
+    entered = threading.Event()
+    release = threading.Event()
+    watchdog_fired = threading.Event()
+
+    def _blocking_menu(*, max_commands):
+        entered.set()
+        release.wait()
+        return ([('help', 'Show help')], 0)
+
+    def _release_on_stall():
+        if not release.wait(timeout=5):
+            watchdog_fired.set()
+            release.set()
+
+    async def _heartbeat():
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release.set()
+
+    watchdog = threading.Thread(target=_release_on_stall, daemon=True)
+    watchdog.start()
+    try:
+        with patch(
+            'hermes_cli.commands_platforms.telegram_menu_commands',
+            side_effect=_blocking_menu,
+        ):
+            await asyncio.gather(adapter._ensure_forum_commands(msg), _heartbeat())
+    finally:
+        release.set()
+        watchdog.join(timeout=1)
+
+    assert entered.is_set()
+    assert not watchdog_fired.is_set()
+    adapter._bot.set_my_commands.assert_awaited_once()

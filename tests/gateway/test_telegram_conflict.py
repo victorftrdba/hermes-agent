@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -406,6 +407,47 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
     await adapter.disconnect()
     assert adapter._post_connect_task is None
     await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_command_menu_scan_does_not_block_event_loop(monkeypatch):
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._bot = SimpleNamespace(set_my_commands=AsyncMock())
+    entered = threading.Event()
+    release = threading.Event()
+    watchdog_fired = threading.Event()
+
+    def _blocking_menu(*, max_commands):
+        entered.set()
+        release.wait()
+        return ([('help', 'Show help')], 0)
+
+    def _release_on_stall():
+        if not release.wait(timeout=5):
+            watchdog_fired.set()
+            release.set()
+
+    async def _heartbeat():
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        release.set()
+
+    monkeypatch.setattr(
+        'hermes_cli.commands_platforms.telegram_menu_commands',
+        _blocking_menu,
+    )
+    watchdog = threading.Thread(target=_release_on_stall, daemon=True)
+    watchdog.start()
+    try:
+        await asyncio.gather(adapter._register_command_menu(), _heartbeat())
+    finally:
+        release.set()
+        watchdog.join(timeout=1)
+
+    assert entered.is_set()
+    assert not watchdog_fired.is_set()
+    assert adapter._bot.set_my_commands.await_count == 3
 
 
 @pytest.mark.asyncio
