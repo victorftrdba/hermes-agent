@@ -212,21 +212,29 @@ class WebhookAdapter(BasePlatformAdapter):
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # /p/<profile>/ routes the event to that profile (honored only under gateway.multiplex_profiles).
         app.router.add_post("/p/{profile}/webhooks/{route_name}", self._handle_webhook)
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        # SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while
-        # both report success → disable. On Linux it only permits rebinding past TIME_WAIT (a quick
-        # restart would otherwise fail to bind for ~60s) → keep the default.
-        site = web.TCPSite(self._runner, self._host, self._port,
-                           reuse_address=False if sys.platform == "darwin" else None)
+        runner = web.AppRunner(app)
+        started = False
         try:
+            await runner.setup()
+            # SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while
+            # both report success → disable. On Linux it only permits rebinding past TIME_WAIT (a quick
+            # restart would otherwise fail to bind for ~60s) → keep the default.
+            site = web.TCPSite(runner, self._host, self._port,
+                               reuse_address=False if sys.platform == "darwin" else None)
             await site.start()
+            started = True
         except OSError as exc:
-            await self._runner.cleanup()
-            self._runner = None
             logger.error("[webhook] Could not bind %s:%d: %s. Set a different host or port in config.yaml under "
                          "platforms.webhook.extra.", self._host or "all IPv4+IPv6 interfaces", self._port, exc)
             return False
+        finally:
+            # CancelledError and any other setup failure must release the local runner (a leaked bind
+            # blocks the same port on the next attempt).
+            if not started:
+                await runner.cleanup()
+                if self._runner is runner:
+                    self._runner = None
+        self._runner = runner
         self._mark_connected()
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
