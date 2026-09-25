@@ -1017,6 +1017,12 @@ except ImportError:
 def _notify_cron_provider_jobs_changed() -> None:
     """Best-effort notify of the active cron provider after a REST mutation (built-in: no-op)."""
     with suppress(Exception):
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        process_manager = getattr(runner, "_cron_process_manager", None) if runner else None
+        if process_manager is not None:
+            process_manager.jobs_changed()
+            return
         from cron.scheduler import _notify_provider_jobs_changed
         _notify_provider_jobs_changed()
 
@@ -2181,6 +2187,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             configured_model=_resolve_gateway_model(), runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
+        process_manager = getattr(self.gateway_runner, "_cron_process_manager", None)
+        if process_manager is not None:
+            cron_status = process_manager.status
+            readiness["checks"]["cron"] = {
+                "status": "degraded" if cron_status.degraded else "ok",
+                "active_count": cron_status.active_count,
+                "restart_count": cron_status.restart_count,
+                "error": cron_status.error,
+            }
+            if cron_status.degraded:
+                readiness["status"] = "degraded"
         return web.json_response({
             "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
             "version": _hermes_version(), "gateway_state": gw_state,
@@ -3480,6 +3497,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     from gateway.run import _gateway_runner_ref
                     runner = _gateway_runner_ref()
             adapters = getattr(runner, "adapters", None) or None
+            process_manager = getattr(runner, "_cron_process_manager", None)
+            if process_manager is not None:
+                from hermes_constants import get_hermes_home
+
+                response = await asyncio.to_thread(
+                    process_manager.fire, job_id, profile_home=str(get_hermes_home()))
+                status = response.get("status")
+                if status == "accepted":
+                    return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+                if status == "duplicate":
+                    return web.json_response({"status": "duplicate", "job_id": job_id}, status=200)
+                logger.error("cron fire admission failed for %s: %s", job_id, response.get("error"))
+                return web.json_response(
+                    {"error": "cron fire admission failed", "job_id": job_id}, status=503)
+
+            from cron.scheduler_provider import InProcessCronScheduler
+            if isinstance(provider, InProcessCronScheduler):
+                return web.json_response(
+                    {"error": "cron scheduler process unavailable", "job_id": job_id}, status=503)
 
             def _detach_fire(fire_fn, *fire_args) -> "web.Response":
                 # The done callback owns the reservation once the task is detached.

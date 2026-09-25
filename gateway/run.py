@@ -3436,6 +3436,7 @@ class GatewayRunner(
         """Initialise run/exit/restart flags, per-session state, and completion-delivery bookkeeping."""
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._cron_process_manager = None
         self._shutdown_event = asyncio.Event()
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
@@ -4524,7 +4525,8 @@ def _start_gateway_housekeeping(
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     chores: list[tuple[int, str, Any]] = []
-    if adapters is not None or runner is not None:
+    if ((adapters is not None or runner is not None)
+            and not getattr(cron_provider, "process_isolated", False)):
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, "Cron durable delivery queue drain",
@@ -4533,7 +4535,7 @@ def _start_gateway_housekeeping(
         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
         (60, "Media cache cleanup", _housekeeping_media_caches),
         (60, "Paste sweep", _housekeeping_paste_sweep)]
-    if cron_provider is not None:
+    if cron_provider is not None and not getattr(cron_provider, "process_isolated", False):
         chores.append((5, "Misfire catch-up sweep", lambda: _housekeeping_misfire_catch_up(cron_provider, adapters, loop)))
     chores += [
         (60, "Curator tick", _housekeeping_curator),
@@ -5040,10 +5042,13 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     multiplex_cron = bool(getattr(runner.config, "multiplex_profiles", False))
     cron_provider = scheduler_for_profile_mode(
         resolve_cron_scheduler(), multiplex_profiles=multiplex_cron)
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    gateway_loop = asyncio.get_running_loop()
+    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": gateway_loop}
+    builtin_provider = isinstance(cron_provider, InProcessCronScheduler)
 
     # Multiplex: tell the ticker which profile homes to tick, else secondary profiles' jobs never run.
-    if isinstance(cron_provider, InProcessCronScheduler) and multiplex_cron:
+    profile_homes = None
+    if builtin_provider and multiplex_cron:
         try:
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
@@ -5060,17 +5065,30 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             logger.warning("Could not resolve profile homes for multiplex cron: %s", exc)
 
     # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
-    if isinstance(cron_provider, InProcessCronScheduler):
-        cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
-    cron_thread = threading.Thread(
-        target=cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, daemon=True,
-        name="cron-scheduler")
-    cron_thread.start()
+    if builtin_provider:
+        from cron.scheduler_process import CronProcessManager
+
+        process_profile_homes = profile_homes or [str(get_hermes_home())]
+        cron_provider = CronProcessManager(
+            profile_homes=process_profile_homes,
+            default_profile=str(get_hermes_home()),
+            default_profile_name="default",
+            adapters=runner.adapters,
+            profile_adapters=getattr(runner, "_profile_adapters", None),
+            loop=gateway_loop,
+        )
+        runner._cron_process_manager = cron_provider
+        cron_provider.start()
+        cron_thread = None
+    else:
+        cron_thread = threading.Thread(
+            target=cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, daemon=True,
+            name="cron-scheduler")
+        cron_thread.start()
 
     # External providers fire over loopback HTTP to THIS process's api_server; if it never came up (usually
     # API_SERVER_KEY missing) every fire fails while manual runs work — misread as a job bug. Say it ONCE.
-    if not isinstance(cron_provider, InProcessCronScheduler):
+    if not builtin_provider:
         try:
             _has_api_server = Platform.API_SERVER in (runner.adapters or {})
         except Exception:
@@ -5089,7 +5107,7 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # Gateway-only housekeeping runs independently of the cron provider; shares cron_stop for shutdown.
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping, args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
+        kwargs={"adapters": runner.adapters, "loop": gateway_loop,
                 "cron_provider": cron_provider, "runner": runner},
         daemon=True, name="gateway-housekeeping")
     housekeeping_thread.start()
@@ -5126,8 +5144,16 @@ async def _start_gateway_shutdown_tail(
     # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
     # finishes before we tear down.
     cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    if getattr(cron_provider, "process_isolated", False):
+        try:
+            await asyncio.to_thread(cron_provider.close)
+        finally:
+            if getattr(runner, "_cron_process_manager", None) is cron_provider:
+                runner._cron_process_manager = None
+    else:
+        _stop_cron_provider(cron_provider)
+    if cron_thread is not None and not await _await_thread_exit(
+            cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
     await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)

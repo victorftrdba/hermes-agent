@@ -230,7 +230,7 @@ class SessionDBPreparationManager:
                 return "unavailable"
             if prep.ready:
                 return "ready"
-            if prep.process is not None:
+            if prep.process is not None or prep.watcher is not None:
                 return "pending"
             return "failed" if prep.failures else "unavailable"
 
@@ -262,10 +262,10 @@ class SessionDBPreparationManager:
                 prep.callbacks.append(on_ready)
             if prep.ready:
                 return "ready"
+            if prep.process is not None or prep.watcher is not None:
+                return "pending"
             if not self._enabled:
                 return "unavailable"
-            if prep.process is not None:
-                return "pending"
             if self._clock() < prep.next_retry_at:
                 return "failed"
             self._launch_locked(path, prep)
@@ -277,7 +277,7 @@ class SessionDBPreparationManager:
             prep = self._preparations.get(path)
             if self._closed or not self._enabled or prep is None:
                 return "unavailable"
-            if prep.process is not None:
+            if prep.process is not None or prep.watcher is not None:
                 return "pending"
             if not prep.ready:
                 return "failed" if prep.failures else "unavailable"
@@ -297,7 +297,7 @@ class SessionDBPreparationManager:
             prep = self._preparations.get(path)
             if prep is None or not prep.ready:
                 return {"status": "unavailable", "failures": 0, "error": None}
-            if prep.process is not None:
+            if prep.process is not None or prep.watcher is not None:
                 status = "pending"
             elif prep.maintenance_failures:
                 status = "failed"
@@ -387,6 +387,7 @@ class SessionDBPreparationManager:
         return None
 
     def _watch(self, path: Path, process: Any, generation: int, maintenance: bool) -> None:
+        watcher = threading.current_thread()
         try:
             stdout, stderr = process.communicate()
             returncode = process.returncode
@@ -398,38 +399,56 @@ class SessionDBPreparationManager:
             and result.get("db_path") == str(path)
         )
         callbacks: list[Callable[[Path, dict[str, Any]], None]] = []
-        with self._lock:
-            prep = self._preparations.get(path)
-            if prep is None or prep.generation != generation or prep.process is not process:
-                return
-            prep.process = None
-            prep.watcher = None
-            if self._closed:
-                return
-            if valid:
-                if maintenance:
-                    prep.maintenance_failures = 0
-                    prep.maintenance_next_retry_at = 0.0
-                    prep.maintenance_error = None
+        failures_before_callbacks = 0
+        try:
+            with self._lock:
+                prep = self._preparations.get(path)
+                if prep is None or prep.generation != generation or prep.process is not process:
+                    return
+                prep.process = None
+                if self._closed:
+                    return
+                if valid:
+                    if maintenance:
+                        prep.maintenance_failures = 0
+                        prep.maintenance_next_retry_at = 0.0
+                        prep.maintenance_error = None
+                    else:
+                        failures_before_callbacks = prep.failures
+                        callbacks = list(prep.callbacks)
+                elif maintenance and prep.ready:
+                    detail = (result or {}).get("error") or (stderr or "").strip()[-500:]
+                    self._record_maintenance_failure_locked(
+                        prep, detail or f"child exited {returncode}",
+                    )
                 else:
-                    prep.ready = True
-                    prep.lifecycle_evidence = None
-                    prep.failures = 0
-                    prep.next_retry_at = 0.0
-                    prep.error = None
-                    callbacks = list(prep.callbacks)
-                    _publish_health(self._health_source, path, "ok")
-            elif maintenance and prep.ready:
-                detail = (result or {}).get("error") or (stderr or "").strip()[-500:]
-                self._record_maintenance_failure_locked(
-                    prep, detail or f"child exited {returncode}",
-                )
-            else:
-                detail = (result or {}).get("error") or (stderr or "").strip()[-500:]
-                self._record_failure_locked(path, prep, detail or f"child exited {returncode}")
-        for callback in callbacks:
-            with contextlib.suppress(Exception):
-                callback(path, result or {})
+                    detail = (result or {}).get("error") or (stderr or "").strip()[-500:]
+                    self._record_failure_locked(
+                        path, prep, detail or f"child exited {returncode}",
+                    )
+            for callback in callbacks:
+                with contextlib.suppress(Exception):
+                    callback(path, result or {})
+            if valid and not maintenance:
+                with self._lock:
+                    prep = self._preparations.get(path)
+                    if (
+                        prep is not None
+                        and prep.generation == generation
+                        and prep.failures == failures_before_callbacks
+                        and not self._closed
+                    ):
+                        prep.ready = True
+                        prep.lifecycle_evidence = None
+                        prep.failures = 0
+                        prep.next_retry_at = 0.0
+                        prep.error = None
+                        _publish_health(self._health_source, path, "ok")
+        finally:
+            with self._lock:
+                prep = self._preparations.get(path)
+                if prep is not None and prep.watcher is watcher:
+                    prep.watcher = None
 
     def close(self, timeout: float = 2.0) -> None:
         with self._lock:
@@ -437,23 +456,26 @@ class SessionDBPreparationManager:
             self._enabled = False
             running = [
                 (prep.process, prep.watcher) for prep in self._preparations.values()
-                if prep.process is not None
+                if prep.process is not None or prep.watcher is not None
             ]
             for prep in self._preparations.values():
                 prep.generation += 1
         for process, _watcher in running:
+            if process is None:
+                continue
             with contextlib.suppress(Exception):
                 process.terminate()
         deadline = self._clock() + max(0.0, timeout)
         for process, watcher in running:
-            remaining = max(0.0, deadline - self._clock())
-            try:
-                process.wait(timeout=remaining)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    process.kill()
-                with contextlib.suppress(Exception):
-                    process.wait(timeout=0.5)
+            if process is not None:
+                remaining = max(0.0, deadline - self._clock())
+                try:
+                    process.wait(timeout=remaining)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        process.kill()
+                    with contextlib.suppress(Exception):
+                        process.wait(timeout=0.5)
             if watcher is not None and watcher is not threading.current_thread():
                 watcher.join(timeout=max(0.0, deadline - self._clock()))
         _deregister_health_source(self._health_source)

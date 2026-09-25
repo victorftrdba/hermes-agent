@@ -51,6 +51,13 @@ class TestActiveCronJobCount:
         runner, _adapter = make_restart_runner()
         assert runner._active_cron_job_count() == 0
 
+    def test_process_scheduler_reports_child_active_count(self):
+        runner, _adapter = make_restart_runner()
+        runner._cron_process_manager = MagicMock()
+        runner._cron_process_manager.status.active_count = 3
+
+        assert runner._active_cron_job_count() == 3
+
 
 class TestDrainWaitsForCronWork:
 
@@ -117,4 +124,3 @@ class TestKillToolSubprocessesMarksCronInterrupted:
 
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
-

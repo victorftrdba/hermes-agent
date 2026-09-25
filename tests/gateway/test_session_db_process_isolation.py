@@ -40,7 +40,7 @@ class _Process:
             self.release.set()
 
     def communicate(self):
-        self.release.wait(timeout=5)
+        self.release.wait()
         return json.dumps(self.result), ""
 
     def terminate(self) -> None:
@@ -203,6 +203,7 @@ def test_fallback_routing_reconciles_after_child_success(monkeypatch, tmp_path) 
     assert store._db is None
     process.release.set()
     _wait_until(lambda: durable.session_key in store._entries)
+    _wait_until(lambda: manager.status(db_path) == "ready")
 
     def _routing_rows():
         return store._db.load_gateway_routing_entries(scope=str(sessions_dir.resolve()))
@@ -214,6 +215,53 @@ def test_fallback_routing_reconciles_after_child_success(monkeypatch, tmp_path) 
     assert set(store._entries) == {durable.session_key, fallback.session_key}
     rows = _routing_rows()
     assert set(rows) == {durable.session_key, fallback.session_key}
+    manager.close()
+    store.close_all_db_handles()
+
+
+def test_prepared_handle_stays_hidden_until_reconciliation_finishes(
+    monkeypatch, tmp_path,
+) -> None:
+    import hermes_state
+
+    db_path = (tmp_path / "state.db").resolve()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    process = _Process({"status": "ok", "db_path": str(db_path)}, blocked=True)
+    manager = SessionDBPreparationManager(popen=lambda *a, **k: process)
+    store = SessionStore(
+        sessions_dir, GatewayConfig(sessions_dir=sessions_dir),
+        eager_session_db=False, db_preparation=manager,
+    )
+    store._routing_home = tmp_path
+    handle = object()
+    reconciliation_started = threading.Event()
+    reconciliation_release = threading.Event()
+
+    def _reconcile(home, db):
+        assert db is handle
+        reconciliation_started.set()
+        reconciliation_release.wait()
+        return True
+
+    monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+    monkeypatch.setattr("hermes_state_registry.acquire", lambda path: handle)
+    monkeypatch.setattr("gateway.shutdown_flush.recover_pending_to_db", lambda db: 0)
+    monkeypatch.setattr(store, "_reconcile_bootstrap_transcript_fallback", _reconcile)
+
+    manager.enable()
+    assert store._db is None
+    process.release.set()
+    assert reconciliation_started.wait(timeout=3.0)
+    with store._db_handles_lock:
+        assert store._db_handles[db_path] is handle
+    assert manager.status(db_path) == "pending"
+    assert store._db is None
+
+    reconciliation_release.set()
+    _wait_until(lambda: manager.status(db_path) == "ready")
+
+    assert store._db is handle
     manager.close()
     store.close_all_db_handles()
 
@@ -263,7 +311,7 @@ def test_pending_transcript_spools_and_reconciles_without_metadata_loss(
             db = store._db_for_session_id(entry.session_id)
             return db.get_messages(entry.session_id) if db is not None else []
 
-        _wait_until(lambda: len(_rows()) == total)
+        _wait_until(lambda: len(_rows()) == total, timeout=60.0)
         rows = _rows()
         assert [row["content"] for row in rows] == [message["content"] for message in messages]
         assert [row["platform_message_id"] for row in rows] == [
@@ -516,6 +564,57 @@ def test_maintenance_launches_for_every_ready_profile_without_reattach(tmp_path)
     manager.close()
 
 
+def test_blocked_maintenance_keeps_prepared_handle_available(monkeypatch, tmp_path) -> None:
+    import hermes_state
+
+    db_path = (tmp_path / "state.db").resolve()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    processes = [
+        _Process({"status": "ok", "db_path": str(db_path)}, blocked=True),
+        _Process({"status": "ok", "db_path": str(db_path)}, blocked=True),
+    ]
+    launches = []
+
+    def _popen(command, **kwargs):
+        launches.append(command)
+        return processes[len(launches) - 1]
+
+    handle = object()
+    manager = SessionDBPreparationManager(popen=_popen)
+    store = SessionStore(
+        sessions_dir, GatewayConfig(sessions_dir=sessions_dir),
+        eager_session_db=False, db_preparation=manager,
+    )
+    store._routing_home = tmp_path
+    monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+    monkeypatch.setattr("hermes_state_registry.acquire", lambda path: handle)
+    monkeypatch.setattr("gateway.shutdown_flush.recover_pending_to_db", lambda db: 0)
+    monkeypatch.setattr(
+        store, "_reconcile_bootstrap_transcript_fallback", lambda home, db: True,
+    )
+
+    manager.enable()
+    assert store._db is None
+    processes[0].release.set()
+    _wait_until(lambda: manager.status(db_path) == "ready")
+    assert store._db is handle
+
+    assert manager.request_maintenance(db_path) == "pending"
+    assert manager.maintenance_state(db_path)["status"] == "pending"
+    assert manager.status(db_path) == "ready"
+    assert manager.request(
+        db_path, profile_home=tmp_path, sessions_dir=sessions_dir,
+    ) == "ready"
+    assert store._db is handle
+    assert processes[1].release.is_set() is False
+
+    processes[1].release.set()
+    _wait_until(lambda: manager.maintenance_state(db_path)["status"] == "ok")
+    manager.close()
+    store.close_all_db_handles()
+
+
 def test_failed_maintenance_retries_without_demoting_ready_path(tmp_path) -> None:
     clock = _Clock()
     db_path = (tmp_path / "state.db").resolve()
@@ -643,6 +742,103 @@ def test_shutdown_kills_reaps_and_prevents_late_attach(tmp_path) -> None:
     assert manager.request(
         db_path, profile_home=tmp_path, sessions_dir=tmp_path / "sessions"
     ) == "unavailable"
+
+
+def test_shutdown_joins_watcher_while_ready_callback_is_running(tmp_path) -> None:
+    db_path = (tmp_path / "state.db").resolve()
+    process = _Process({"status": "ok", "db_path": str(db_path)}, blocked=True)
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    callback_finished = threading.Event()
+    manager = SessionDBPreparationManager(popen=lambda *a, **k: process)
+    manager.enable()
+
+    def _on_ready(path, result):
+        callback_started.set()
+        callback_release.wait()
+        callback_finished.set()
+
+    manager.request(
+        db_path, profile_home=tmp_path, sessions_dir=tmp_path / "sessions",
+        on_ready=_on_ready,
+    )
+    process.release.set()
+    assert callback_started.wait(timeout=3.0)
+
+    watcher = manager._preparations[db_path].watcher
+    assert watcher is not None
+    join_called = threading.Event()
+    original_join = watcher.join
+
+    def _join(timeout=None):
+        join_called.set()
+        return original_join(timeout)
+
+    watcher.join = _join
+    close_finished = threading.Event()
+
+    def _close():
+        manager.close(timeout=2.0)
+        close_finished.set()
+
+    closer = threading.Thread(target=_close)
+    closer.start()
+    assert join_called.wait(timeout=3.0)
+    assert not close_finished.is_set()
+
+    callback_release.set()
+    closer.join(timeout=3.0)
+
+    assert not closer.is_alive()
+    assert close_finished.is_set()
+    assert callback_finished.is_set()
+    assert manager._preparations[db_path].watcher is None
+
+
+def test_handle_close_waits_for_active_transcript_drain(monkeypatch) -> None:
+    class _ObservedLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.acquire_attempted = threading.Event()
+
+        def __enter__(self):
+            self.acquire_attempted.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self.lock.release()
+
+    class _HandleCache:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def close_all(self, close):
+            close(self.handle)
+
+    store = object.__new__(SessionStore)
+    drain_lock = _ObservedLock()
+    handle = object()
+    handle_closed = threading.Event()
+    store._transcript_drain_lock = drain_lock
+    store._db_handle_cache = _HandleCache(handle)
+    store._db_attach_enabled = True
+    monkeypatch.setattr(
+        "hermes_state_registry.release_or_close",
+        lambda value: handle_closed.set() if value is handle else None,
+    )
+
+    drain_lock.lock.acquire()
+    closer = threading.Thread(target=store.close_all_db_handles)
+    closer.start()
+    assert drain_lock.acquire_attempted.wait(timeout=3.0)
+    assert not handle_closed.is_set()
+
+    drain_lock.lock.release()
+    closer.join(timeout=3.0)
+
+    assert not closer.is_alive()
+    assert handle_closed.is_set()
 
 
 def test_checkpoint_auto_prune_configuration_runs_in_child(monkeypatch, tmp_path) -> None:

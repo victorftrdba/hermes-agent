@@ -55,6 +55,70 @@ class _SpyProvider:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manager_result", "expected_status"),
+    [
+        ({"status": "accepted"}, 202),
+        ({"status": "duplicate"}, 200),
+        ({"status": "error", "error": "child unavailable"}, 503),
+    ],
+)
+async def test_builtin_fire_uses_process_rpc(adapter, monkeypatch, manager_result, expected_status):
+    calls = []
+
+    class ProcessManager:
+        def fire(self, job_id, *, profile_home):
+            calls.append((job_id, profile_home, threading.get_ident()))
+            return manager_result
+
+    runner = SimpleNamespace(
+        _draining=False,
+        _external_drain_active=False,
+        _cron_process_manager=ProcessManager(),
+        adapters={},
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    app = _create_app(adapter)
+    loop_thread = threading.get_ident()
+    with patch("gateway.run._gateway_runner_ref", lambda: runner):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                "/api/cron/fire",
+                headers={"Authorization": "Bearer good"},
+                json={"job_id": "abc123"},
+            )
+
+    assert response.status == expected_status
+    assert calls[0][0] == "abc123"
+    assert calls[0][2] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_builtin_fire_without_child_fails_closed(adapter, monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler", InProcessCronScheduler
+    )
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **kw: {"purpose": "cron_fire"}),
+    )
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/cron/fire",
+            headers={"Authorization": "Bearer good"},
+            json={"job_id": "abc123"},
+        )
+
+    assert response.status == 503
+
+
+@pytest.mark.asyncio
 async def test_valid_fire_reservation_blocks_drain_before_body_and_task(adapter, monkeypatch):
     runner = SimpleNamespace(_draining=False, _external_drain_active=False)
     body_started = asyncio.Event()

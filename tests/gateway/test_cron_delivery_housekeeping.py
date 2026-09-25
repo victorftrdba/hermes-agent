@@ -56,6 +56,27 @@ def test_gateway_housekeeping_drains_cron_delivery_without_connected_adapters(mo
     assert calls == [(adapters, loop)]
 
 
+def test_process_isolated_cron_does_not_drain_sqlite_in_gateway(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        scheduler,
+        "drain_delivery_queue",
+        lambda *_args: calls.append("drain"),
+        raising=False,
+    )
+
+    gateway_run._start_gateway_housekeeping(
+        _OneTickStopEvent(),
+        adapters={},
+        loop=object(),
+        interval=0,
+        cron_provider=SimpleNamespace(process_isolated=True),
+        runner=SimpleNamespace(),
+    )
+
+    assert calls == []
+
+
 def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
     tmp_path, monkeypatch
 ):
