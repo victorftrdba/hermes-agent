@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -86,17 +89,134 @@ def terminal_env(name: str, default: str = "") -> str:
     return default if value is None else str(value)
 
 
+_FileSignature = Optional[Tuple[int, int, int, int, int]]
+_ScopeFingerprint = Tuple[_FileSignature, _FileSignature]
+
+
+@dataclass(frozen=True)
+class _CachedScope:
+    """A policy outcome pinned to the exact fingerprint of the files it was read from."""
+
+    fingerprint: _ScopeFingerprint
+    scope: Optional[Dict[str, str]] = None
+    error: Optional[str] = None
+
+    def resolve(self) -> Dict[str, str]:
+        if self.error is not None:
+            raise TerminalPolicyUnavailable(self.error)
+        return dict(self.scope or {})
+
+
+# Canonical home -> latest outcome and -> single-flight parse lock; both guarded by _SCOPE_CACHE_LOCK.
+_SCOPE_CACHE: Dict[str, _CachedScope] = {}
+_SCOPE_CACHE_LOCK = threading.Lock()
+_HOME_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def _home_lock(home_key: str) -> threading.Lock:
+    with _SCOPE_CACHE_LOCK:
+        lock = _HOME_LOCKS.get(home_key)
+        if lock is None:
+            lock = threading.Lock()
+            _HOME_LOCKS[home_key] = lock
+        return lock
+
+
+def _file_signature(path: Path) -> _FileSignature:
+    """Missing file -> None; present -> identity, size and mtime/ctime nanoseconds."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise TerminalPolicyUnavailable(f"cannot stat {path}: {exc}") from exc
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _scope_fingerprint(home: Path) -> _ScopeFingerprint:
+    return (_file_signature(home / ".env"), _file_signature(home / "config.yaml"))
+
+
+def _validate_dotenv(text: str, path: Path) -> None:
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
+            raise TerminalPolicyUnavailable(f"cannot parse {path}: invalid line {line_number}")
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            escaped = False
+            closing_index = None
+            for index, character in enumerate(value[1:], start=1):
+                if quote == '"' and character == "\\" and not escaped:
+                    escaped = True
+                    continue
+                if character == quote and not escaped:
+                    closing_index = index
+                    break
+                escaped = False
+            if closing_index is None:
+                raise TerminalPolicyUnavailable(
+                    f"cannot parse {path}: unterminated quote on line {line_number}"
+                )
+            trailing = value[closing_index + 1:].lstrip()
+            if trailing and not trailing.startswith("#"):
+                raise TerminalPolicyUnavailable(f"cannot parse {path}: invalid line {line_number}")
+
+
 def build_profile_terminal_scope(hermes_home: "Any") -> Dict[str, str]:
     """Build the COMPLETE effective ``TERMINAL_*`` policy for a profile home.
 
     Projection: ``DEFAULT_CONFIG['terminal']`` <- profile ``.env`` TERMINAL_* <- profile
     ``config.yaml`` ``terminal:``. Total by construction, so a bound scope never widens back to
     ambient authority. Raises :class:`TerminalPolicyUnavailable` if a present file is unreadable.
+
+    Outcomes are cached per canonical home under a single-flight lock, keyed by the
+    ``(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)`` fingerprint of BOTH files; an exact
+    hit returns a defensive copy. Replacing either file changes its fingerprint and forces a
+    re-parse. The fingerprint is checked again after reading: a file replaced mid-read yields a
+    refusal rather than a torn mapping, and the next call parses the replacement. Parse failures
+    are cached against their unchanged fingerprint, so a broken file is not re-parsed and fixing
+    it recovers.
     """
+    home = Path(hermes_home).resolve()
+    home_key = str(home)
+    with _home_lock(home_key):
+        before = _scope_fingerprint(home)
+        with _SCOPE_CACHE_LOCK:
+            cached = _SCOPE_CACHE.get(home_key)
+            if cached is not None and cached.fingerprint == before:
+                return cached.resolve()
+        error: Optional[str] = None
+        try:
+            scope: Optional[Dict[str, str]] = _build_profile_terminal_scope_uncached(home)
+        except TerminalPolicyUnavailable as exc:
+            scope = None
+            error = str(exc)
+        after = _scope_fingerprint(home)
+        if after != before:
+            scope = None
+            error = f"terminal policy files under {home} changed while being read"
+        entry = _CachedScope(
+            fingerprint=before if after != before else after,
+            scope=scope,
+            error=error,
+        )
+        with _SCOPE_CACHE_LOCK:
+            _SCOPE_CACHE[home_key] = entry
+        return entry.resolve()
+
+
+def _build_profile_terminal_scope_uncached(home: Path) -> Dict[str, str]:
+    """Parse a profile's files into its policy; no caching, one full read."""
     from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
-    home = Path(hermes_home)
     scope: Dict[str, str] = {}
 
     def _apply(mapping: Dict[str, Any]) -> None:
@@ -117,9 +237,10 @@ def build_profile_terminal_scope(hermes_home: "Any") -> Dict[str, str]:
         # load_env_file swallows OSError by design (secret scope fails soft); an unreadable
         # profile .env must fail closed here.
         try:
-            env_path.read_bytes()
+            env_text = env_path.read_text(encoding="utf-8-sig")
         except Exception as exc:
             raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
+        _validate_dotenv(env_text, env_path)
         from agent.secret_scope import load_env_file
 
         scope.update((k, str(v)) for k, v in load_env_file(env_path).items()
@@ -139,8 +260,16 @@ def build_profile_terminal_scope(hermes_home: "Any") -> Dict[str, str]:
                 raw = fast_safe_load(f)
         except Exception as exc:
             raise TerminalPolicyUnavailable(f"cannot parse {config_path}: {exc}") from exc
-        raw_terminal = raw.get("terminal") if isinstance(raw, dict) else None
-        if isinstance(raw_terminal, dict):
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise TerminalPolicyUnavailable(f"cannot parse {config_path}: root must be a mapping")
+        raw_terminal = raw.get("terminal")
+        if raw_terminal is not None and not isinstance(raw_terminal, dict):
+            raise TerminalPolicyUnavailable(
+                f"cannot parse {config_path}: terminal must be a mapping"
+            )
+        if raw_terminal is not None:
             _apply(raw_terminal)
     return scope
 

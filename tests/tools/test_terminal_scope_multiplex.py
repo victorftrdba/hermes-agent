@@ -12,6 +12,8 @@ unresolvable policy fails closed.
 
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -240,3 +242,207 @@ def test_dotenv_json_strings_stay_json_strings(tmp_path):
     scope = build_profile_terminal_scope(home)
     assert json.loads(scope["TERMINAL_DOCKER_FORWARD_ENV"]) == ["EMAIL_HOME_ADDRESS"]
     assert json.loads(scope["TERMINAL_DOCKER_VOLUMES"]) == ["/tmp/a:/data"]
+
+
+def _count_config_parses(monkeypatch, delay=0.0):
+    """Count fast_safe_load calls made through the module the builder imports from."""
+    import hermes_cli.config as config_mod
+
+    loads = []
+    real_fast_safe_load = config_mod.fast_safe_load
+
+    def counting_fast_safe_load(stream):
+        loads.append(1)
+        if delay:
+            time.sleep(delay)
+        return real_fast_safe_load(stream)
+
+    monkeypatch.setattr(config_mod, "fast_safe_load", counting_fast_safe_load)
+    return loads
+
+
+def test_unchanged_profile_policy_is_parsed_once(tmp_path, monkeypatch):
+    """Criterion 1: an unchanged profile is parsed once, whichever surface asks."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    loads = _count_config_parses(monkeypatch)
+    home = _profile(
+        tmp_path, "stable",
+        "terminal:\n  backend: local\n  docker_image: alpine:3.20\n",
+    )
+
+    first = build_profile_terminal_scope(home)
+    second = build_profile_terminal_scope(home)
+
+    assert first == second
+    assert first["TERMINAL_ENV"] == "local"
+    assert first["TERMINAL_DOCKER_IMAGE"] == "alpine:3.20"
+    assert len(loads) == 1
+
+
+def test_cached_policy_is_returned_as_a_defensive_copy(tmp_path, monkeypatch):
+    """Criterion 4: mutating a returned mapping must not poison the cache."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    loads = _count_config_parses(monkeypatch)
+    home = _profile(
+        tmp_path, "copy",
+        "terminal:\n  backend: local\n  docker_image: alpine:3.20\n",
+    )
+
+    first = build_profile_terminal_scope(home)
+    first["TERMINAL_ENV"] = "docker"
+    first["TERMINAL_DOCKER_IMAGE"] = "poisoned"
+    second = build_profile_terminal_scope(home)
+
+    assert second is not first
+    assert second["TERMINAL_ENV"] == "local"
+    assert second["TERMINAL_DOCKER_IMAGE"] == "alpine:3.20"
+    assert len(loads) == 1
+
+
+def test_config_change_invalidates_cached_policy(tmp_path, monkeypatch):
+    """Criterion 2 (config.yaml): a mutation is observed on the next call."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    loads = _count_config_parses(monkeypatch)
+    home = _profile(tmp_path, "mut-config", "terminal:\n  backend: local\n")
+
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "local"
+
+    (home / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_image: alpine:3.20\n", encoding="utf-8"
+    )
+    scope = build_profile_terminal_scope(home)
+
+    assert scope["TERMINAL_ENV"] == "docker"
+    assert scope["TERMINAL_DOCKER_IMAGE"] == "alpine:3.20"
+    assert len(loads) == 2
+
+
+def test_dotenv_change_invalidates_cached_policy(tmp_path):
+    """Criterion 2 (.env): a mutation is observed on the next call."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(
+        tmp_path, "mut-dotenv", "",
+        "TERMINAL_ENV=local\nTERMINAL_SSH_HOST=10.0.0.1\n",
+    )
+
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "local"
+
+    (home / ".env").write_text(
+        "TERMINAL_ENV=docker\nTERMINAL_SSH_HOST=10.0.0.2\n", encoding="utf-8"
+    )
+    scope = build_profile_terminal_scope(home)
+
+    assert scope["TERMINAL_ENV"] == "docker"
+    assert scope["TERMINAL_SSH_HOST"] == "10.0.0.2"
+
+
+def test_malformed_policy_refusal_is_cached_then_recovers(tmp_path, monkeypatch):
+    """Criterion 3: an unchanged malformed file is refused from cache; fixing it recovers."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    loads = _count_config_parses(monkeypatch)
+    home = _profile(tmp_path, "recovers", "terminal: [unclosed\n")
+
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+    assert len(loads) == 1
+
+    (home / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "local"
+    assert len(loads) == 2
+
+
+@pytest.mark.parametrize("config_text", ["[]\n", "terminal: local\n"])
+def test_structurally_invalid_config_fails_closed(tmp_path, config_text):
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(tmp_path, "invalid-structure", config_text)
+
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+
+
+def test_null_terminal_section_preserves_defaults(tmp_path):
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(tmp_path, "null-terminal", "terminal: null\n")
+
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "local"
+
+
+def test_invalid_utf8_dotenv_fails_closed(tmp_path):
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(tmp_path, "invalid-dotenv", "terminal:\n  backend: local\n")
+    (home / ".env").write_bytes(b"TERMINAL_ENV=local\xff\n")
+
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+
+
+@pytest.mark.parametrize(
+    "dotenv_text",
+    ["TERMINAL_ENV\n", "TERMINAL ENV=local\n", "TERMINAL_ENV='local\n"],
+)
+def test_malformed_dotenv_fails_closed(tmp_path, dotenv_text):
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(tmp_path, "malformed-dotenv", "terminal:\n  backend: local\n", dotenv_text)
+
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+
+
+def test_concurrent_callers_for_one_profile_parse_once(tmp_path, monkeypatch):
+    """Criterion 5: concurrent misses single-flight into one parse (criterion 1 across threads)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    loads = _count_config_parses(monkeypatch, delay=0.1)
+    home = _profile(tmp_path, "concurrent", "terminal:\n  backend: local\n")
+    barrier = threading.Barrier(6)
+
+    def call():
+        barrier.wait(timeout=30)
+        return build_profile_terminal_scope(home)["TERMINAL_ENV"]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = [future.result(timeout=60) for future in [pool.submit(call) for _ in range(6)]]
+
+    assert results == ["local"] * 6
+    assert len(loads) == 1
+
+
+def test_torn_read_refuses_and_never_serves_the_stale_cached_mapping(tmp_path, monkeypatch):
+    """Criterion 3: a file replaced mid-read refuses once, then parses the stable replacement."""
+    import hermes_cli.config as config_mod
+
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(tmp_path, "torn", "terminal:\n  backend: local\n")
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "local"
+
+    real_fast_safe_load = config_mod.fast_safe_load
+    parses = []
+
+    def replace_during_parse(stream):
+        parses.append(1)
+        if len(parses) == 1:
+            (home / "config.yaml").write_text("terminal:\n  backend: ssh\n", encoding="utf-8")
+        return real_fast_safe_load(stream)
+
+    (home / "config.yaml").write_text("terminal:\n  backend: docker\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "fast_safe_load", replace_during_parse)
+
+    with pytest.raises(TerminalPolicyUnavailable):
+        build_profile_terminal_scope(home)
+    assert build_profile_terminal_scope(home)["TERMINAL_ENV"] == "ssh"
+    assert len(parses) == 2
