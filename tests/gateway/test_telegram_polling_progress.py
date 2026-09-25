@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -285,27 +287,32 @@ async def test_non_finite_fallback_discovery_timeout_uses_finite_default(monkeyp
     builders = _configure_lifecycle_connect(monkeypatch, adapter, [polling_app])
     monkeypatch.setenv("HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT", "nan")
 
+    discovery_entered = threading.Event()
+    discovery_released = threading.Event()
+
     async def stuck_discovery():
-        await asyncio.Event().wait()
+        discovery_entered.set()
+        await asyncio.to_thread(discovery_released.wait)
 
-    original_deadline = tg_adapter._await_with_thread_deadline
+    original_bridge = tg_adapter._await_offloaded_sync
 
-    async def deadline(awaitable, timeout, **_kwargs):
-        if getattr(getattr(awaitable, "cr_code", None), "co_name", "") == "stuck_discovery":
-            assert timeout == 5.0
-            awaitable.close()
-            raise asyncio.TimeoutError()
-        return await original_deadline(awaitable, timeout, **_kwargs)
+    async def offloaded_bridge(operation, timeout, **kwargs):
+        assert timeout == 5.0
+        return await original_bridge(operation, timeout=1.0, **kwargs)
 
     monkeypatch.setattr(tg_adapter, "discover_fallback_ips", stuck_discovery)
-    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", deadline)
+    monkeypatch.setattr(tg_adapter, "_await_offloaded_sync", offloaded_bridge)
 
-    assert await adapter.connect() is True
-    httpx_kwargs = builders[0].polling_request.kwargs.get("httpx_kwargs") or {}
-    transport = httpx_kwargs.get("transport")
-    assert isinstance(transport, tg_adapter.TelegramFallbackTransport)
-    assert transport._fallback_ips == list(tg_adapter.SEED_FALLBACK_IPS)
-    await adapter.disconnect()
+    try:
+        assert await adapter.connect() is True
+        assert discovery_entered.is_set()
+        httpx_kwargs = builders[0].polling_request.kwargs.get("httpx_kwargs") or {}
+        transport = httpx_kwargs.get("transport")
+        assert isinstance(transport, tg_adapter.TelegramFallbackTransport)
+        assert transport._fallback_ips == list(tg_adapter.SEED_FALLBACK_IPS)
+    finally:
+        discovery_released.set()
+        await adapter.disconnect()
 
 
 @pytest.mark.asyncio
@@ -528,3 +535,118 @@ async def test_disconnect_cancels_recovery_before_it_can_rearm_progress(monkeypa
             if not task.done():
                 task.cancel()
         await asyncio.gather(recovery, disconnect, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_fallback_discovery_cold_producer_runs_off_event_loop(monkeypatch):
+    """The complete fallback-IP discovery producer runs off the loop: a synchronously
+    blocked producer must not freeze an independent heartbeat, the bridge must not depend
+    on the default executor, and construction keeps the existing fallback-IP transport
+    behavior."""
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", _ControlledRequest)
+    monkeypatch.setattr(tg_adapter, "resolve_proxy_url", lambda *args, **kwargs: None)
+
+    original_to_thread = asyncio.to_thread
+    forbid_default_executor = threading.Event()
+    forbid_default_executor.set()
+
+    async def forbid_to_thread(func, *args, **kwargs):
+        if forbid_default_executor.is_set():
+            raise AssertionError("fallback-discovery bridge must not use the default executor")
+        return await original_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", forbid_to_thread)
+
+    producer_entered = threading.Event()
+    producer_released = threading.Event()
+    producer_finished = threading.Event()
+
+    async def blocking_discovery():
+        producer_entered.set()
+        producer_released.wait(timeout=5)
+        producer_finished.set()
+        return ["149.154.167.220"]
+
+    monkeypatch.setattr(tg_adapter, "discover_fallback_ips", blocking_discovery)
+
+    heartbeats = 0
+    heartbeat_stop = asyncio.Event()
+
+    async def heartbeat():
+        nonlocal heartbeats
+        while not heartbeat_stop.is_set():
+            await asyncio.sleep(0.01)
+            heartbeats += 1
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    build_task = asyncio.create_task(adapter._build_ptb_requests())
+    producer_seen = False
+    finished_before_release = True
+    heartbeat_advanced_while_blocked = False
+    try:
+        deadline = time.monotonic() + 5
+        while not producer_entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        producer_seen = producer_entered.is_set()
+        finished_before_release = producer_finished.is_set()
+        heartbeats_before = heartbeats
+        await asyncio.sleep(0.05)
+        heartbeat_advanced_while_blocked = (
+            not producer_finished.is_set() and heartbeats > heartbeats_before
+        )
+    finally:
+        forbid_default_executor.clear()
+        producer_released.set()
+        heartbeat_stop.set()
+
+    try:
+        request, get_updates_request = await asyncio.wait_for(build_task, timeout=10)
+    except BaseException:
+        build_task.cancel()
+        await asyncio.gather(build_task, heartbeat_task, return_exceptions=True)
+        raise
+    await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+    assert producer_seen, "the cold fallback-discovery producer never ran"
+    assert not finished_before_release
+    assert heartbeat_advanced_while_blocked
+
+    httpx_kwargs = get_updates_request.kwargs.get("httpx_kwargs") or {}
+    transport = httpx_kwargs.get("transport")
+    assert isinstance(transport, tg_adapter.TelegramFallbackTransport)
+    assert transport._fallback_ips == ["149.154.167.220"]
+    request_transport = (request.kwargs.get("httpx_kwargs") or {}).get("transport")
+    assert isinstance(request_transport, tg_adapter.TelegramFallbackTransport)
+    assert request_transport._fallback_ips == ["149.154.167.220"]
+
+
+@pytest.mark.asyncio
+async def test_offloaded_sync_deadline_blocks_operation_that_starts_late(monkeypatch):
+    """A bounded worker that only starts after the captured deadline must not run the
+    operation it was handed: the guarded callable rechecks the absolute deadline first."""
+    operation_called = threading.Event()
+    wrapper_finished = threading.Event()
+
+    def fake_run_bounded_sync(fn, timeout, *, label):
+        time.sleep(timeout + 0.25)
+        try:
+            fn()
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            wrapper_finished.set()
+        return MagicMock(timed_out=True, value=None)
+
+    monkeypatch.setattr(tg_adapter, "run_bounded_sync", fake_run_bounded_sync)
+
+    def operation():
+        operation_called.set()
+        return "ran"
+
+    with pytest.raises(asyncio.TimeoutError):
+        await tg_adapter._await_offloaded_sync(operation, timeout=0.05)
+
+    assert wrapper_finished.wait(timeout=5), "the offload wrapper never finished"
+    assert not operation_called.is_set()
