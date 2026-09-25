@@ -702,3 +702,100 @@ def test_gateway_drain_retains_and_formats_overflow_events():
     out_released = _format_gateway_process_notification(released)
     assert "notifications resumed" in out_released
     assert "exit code" not in out_released
+
+
+# ---------------------------------------------------------------------------
+# Notification-mode loader must run off the event loop (criterion 18)
+# ---------------------------------------------------------------------------
+
+
+def _blocking_loader(heartbeat_getter, state, entered, release):
+    """Loader stub that blocks on a release Event and observes heartbeat progress."""
+
+    def _loader():
+        state["loader_thread"] = threading.get_ident()
+        start = heartbeat_getter()
+        entered.set()
+        release.wait(timeout=2)
+        state["heartbeat_advanced"] = heartbeat_getter() > start
+        return "all"
+
+    return _loader
+
+
+async def _heartbeat_loop(increment):
+    while True:
+        await asyncio.sleep(0.01)
+        increment()
+
+
+@pytest.mark.asyncio
+async def test_drain_watch_notifications_loader_does_not_block_loop(monkeypatch, tmp_path):
+    """While ``_drain_watch_notifications`` awaits the notification-mode loader,
+    an independent asyncio heartbeat keeps advancing."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    loop_thread = threading.get_ident()
+    entered = threading.Event()
+    release = threading.Event()
+    state = {"loader_thread": None, "heartbeat_advanced": False}
+    counter = {"n": 0}
+
+    def _beat():
+        counter["n"] += 1
+
+    monkeypatch.setattr(
+        runner,
+        "_load_background_notifications_mode",
+        _blocking_loader(lambda: counter["n"], state, entered, release),
+    )
+
+    ticker = asyncio.create_task(_heartbeat_loop(_beat))
+    drain = asyncio.create_task(runner._drain_watch_notifications(queue.Queue()))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+    finally:
+        release.set()
+        await asyncio.wait_for(drain, 5)
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+
+    assert state["loader_thread"] != loop_thread
+    assert state["heartbeat_advanced"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_process_watcher_loader_does_not_block_loop(monkeypatch, tmp_path):
+    """While ``_run_process_watcher`` awaits the notification-mode loader, an
+    independent asyncio heartbeat keeps advancing."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    loop_thread = threading.get_ident()
+    entered = threading.Event()
+    release = threading.Event()
+    state = {"loader_thread": None, "heartbeat_advanced": False}
+    counter = {"n": 0}
+
+    def _beat():
+        counter["n"] += 1
+
+    monkeypatch.setattr(
+        runner,
+        "_load_background_notifications_mode",
+        _blocking_loader(lambda: counter["n"], state, entered, release),
+    )
+
+    ticker = asyncio.create_task(_heartbeat_loop(_beat))
+    watcher = asyncio.create_task(runner._run_process_watcher(_watcher_dict()))
+    try:
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+    finally:
+        release.set()
+        await asyncio.wait_for(watcher, 5)
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+
+    assert state["loader_thread"] != loop_thread
+    assert state["heartbeat_advanced"] is True
