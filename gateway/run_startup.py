@@ -723,11 +723,13 @@ class GatewayStartupMixin:
             with _log_suppressed(logging.DEBUG, "faulthandler.enable() unavailable", exc_info=True):
                 faulthandler.enable(file=self._open_faulthandler_log(), all_threads=True)
         # SIGUSR2 stack dump to file for service managers that drop stderr; POSIX-only.
+        # chain=False: the default SIGUSR2 action terminates the process, so chaining turned a
+        # diagnostic dump into a restart.
         _sigusr2 = getattr(signal, "SIGUSR2", None)
         if _sigusr2 is not None and hasattr(faulthandler, "register"):
             with _log_suppressed(logging.DEBUG, "Could not set up faulthandler file logging", exc_info=True):
                 faulthandler.register(
-                    _sigusr2, file=self._open_faulthandler_log(), all_threads=True, chain=True,
+                    _sigusr2, file=self._open_faulthandler_log(), all_threads=True, chain=False,
                 )
 
     def _start_log_startup_environment(self) -> None:
