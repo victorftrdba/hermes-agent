@@ -894,7 +894,7 @@ class GatewayNotificationsMixin:
         """
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
         watch_events = _drain_gateway_watch_events(completion_queue)
-        if self._load_background_notifications_mode() == "off":
+        if await asyncio.to_thread(self._load_background_notifications_mode) == "off":
             return
         for evt in watch_events:
             synth_text = _format_gateway_process_notification(evt)
@@ -1609,7 +1609,7 @@ class GatewayNotificationsMixin:
         chat_id = watcher.get("chat_id", "")
         thread_id = watcher.get("thread_id", "")
         agent_notify = watcher.get("notify_on_complete", False)
-        notify_mode = self._load_background_notifications_mode()
+        notify_mode = await asyncio.to_thread(self._load_background_notifications_mode)
         logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
                       session_id, interval, notify_mode, agent_notify)
         silent = notify_mode == "off" and not agent_notify
