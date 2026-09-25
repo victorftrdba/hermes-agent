@@ -1,13 +1,26 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import asyncio
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform, StreamingConfig
+from gateway.config import Platform, PlatformConfig, StreamingConfig
+from gateway.platforms import base as gw_base
 from gateway.platforms.base import resolve_proxy_url
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from plugins.platforms.telegram import adapter as tg_adapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+@pytest.fixture(autouse=True)
+def _isolate_macos_system_proxy_cache():
+    gw_base.reset_macos_system_proxy_cache()
+    yield
+    gw_base.reset_macos_system_proxy_cache()
 
 
 def _make_runner(proxy_url=None):
@@ -294,4 +307,185 @@ class TestEnvVarRegistration:
         info = OPTIONAL_ENV_VARS["GATEWAY_PROXY_URL"]
         assert info["category"] == "messaging"
         assert info["password"] is False
+
+
+_SCUTIL_HTTPS_8443 = "HTTPSEnable : 1\nHTTPSProxy : 10.0.0.1\nHTTPSPort : 8443\n"
+_SCUTIL_HTTPS_8444 = "HTTPSEnable : 1\nHTTPSProxy : 10.0.0.2\nHTTPSPort : 8444\n"
+
+
+class TestMacosSystemProxyCache:
+    """Criterion 19: the scutil probe is cached process-wide for 60s (failures included),
+    concurrent cold callers fork it once, and non-macOS never forks — while env and NO_PROXY
+    evaluation stay live outside the cache."""
+
+    @staticmethod
+    def _install_probe(monkeypatch, outputs):
+        calls = []
+
+        def _check_output(cmd, **kwargs):
+            calls.append(cmd)
+            result = outputs[min(len(calls) - 1, len(outputs) - 1)]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        monkeypatch.setattr(gw_base.sys, "platform", "darwin")
+        monkeypatch.setattr(gw_base.subprocess, "check_output", _check_output)
+        return calls
+
+    def test_repeated_success_probes_once(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [_SCUTIL_HTTPS_8443])
+
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.1:8443"
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.1:8443"
+
+        assert len(calls) == 1
+
+    def test_failure_is_cached_too(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [OSError("scutil not found")])
+
+        assert gw_base._detect_macos_system_proxy() is None
+        assert gw_base._detect_macos_system_proxy() is None
+
+        assert len(calls) == 1
+
+    def test_ttl_expiry_refreshes_probe(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [_SCUTIL_HTTPS_8443, _SCUTIL_HTTPS_8444])
+
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.1:8443"
+        gw_base._macos_system_proxy_cache = (
+            time.monotonic() - gw_base._MACOS_SYSTEM_PROXY_CACHE_TTL - 1.0, "http://10.0.0.1:8443")
+
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.2:8444"
+
+        assert len(calls) == 2
+
+    def test_reset_helper_forces_live_probe(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [_SCUTIL_HTTPS_8443, _SCUTIL_HTTPS_8444])
+
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.1:8443"
+        gw_base.reset_macos_system_proxy_cache()
+
+        assert gw_base._detect_macos_system_proxy() == "http://10.0.0.2:8444"
+
+        assert len(calls) == 2
+
+    def test_non_darwin_never_probes(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [AssertionError("scutil must not run off macOS")])
+        monkeypatch.setattr(gw_base.sys, "platform", "linux")
+
+        assert gw_base._detect_macos_system_proxy() is None
+
+        assert calls == []
+
+    def test_concurrent_cold_callers_probe_once(self, monkeypatch):
+        calls = self._install_probe(monkeypatch, [_SCUTIL_HTTPS_8443])
+
+        def _slow_check_output(cmd, **kwargs):
+            calls.append(cmd)
+            time.sleep(0.2)
+            return _SCUTIL_HTTPS_8443
+
+        monkeypatch.setattr(gw_base.subprocess, "check_output", _slow_check_output)
+
+        workers = 8
+        barrier = threading.Barrier(workers)
+        results = [None] * workers
+
+        def _worker(index):
+            barrier.wait()
+            results[index] = gw_base._detect_macos_system_proxy()
+
+        threads = [threading.Thread(target=_worker, args=(index,)) for index in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert results == ["http://10.0.0.1:8443"] * workers
+        assert len(calls) == 1
+
+    def test_warm_cache_leaves_env_and_no_proxy_evaluation_live(self, monkeypatch):
+        for key in ("TELEGRAM_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                    "https_proxy", "http_proxy", "all_proxy", "NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(key, raising=False)
+        calls = self._install_probe(monkeypatch, [_SCUTIL_HTTPS_8443])
+
+        assert resolve_proxy_url(target_hosts="api.telegram.org") == "http://10.0.0.1:8443"
+
+        monkeypatch.setenv("TELEGRAM_PROXY", "http://platform.example:3128")
+        assert resolve_proxy_url("TELEGRAM_PROXY", target_hosts="api.telegram.org") == "http://platform.example:3128"
+
+        monkeypatch.setenv("NO_PROXY", "api.telegram.org")
+        assert resolve_proxy_url("TELEGRAM_PROXY", target_hosts="api.telegram.org") is None
+
+        assert len(calls) == 1
+
+
+class _StubHTTPXRequest:
+    """Records HTTPXRequest constructor kwargs without building a real PTB request pool."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class TestTelegramProxyProbeOffLoop:
+    """Criterion 19: Telegram request construction resolves the proxy on a worker thread, so a
+    blocked cold scutil probe cannot freeze the Gateway event loop."""
+
+    @pytest.mark.asyncio
+    async def test_blocked_cold_probe_keeps_loop_heartbeat(self, monkeypatch):
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        monkeypatch.setattr(adapter, "_fallback_ips", lambda: [])
+        monkeypatch.setattr(tg_adapter, "HTTPXRequest", _StubHTTPXRequest)
+
+        async def _no_fallback():
+            return []
+
+        monkeypatch.setattr(tg_adapter, "discover_fallback_ips", _no_fallback)
+
+        probe_entered = threading.Event()
+        probe_released = threading.Event()
+        probe_finished = threading.Event()
+
+        def _blocked_resolve_proxy(*args, **kwargs):
+            probe_entered.set()
+            probe_released.wait(timeout=5)
+            probe_finished.set()
+            return "http://127.0.0.1:8080"
+
+        monkeypatch.setattr(tg_adapter, "resolve_proxy_url", _blocked_resolve_proxy)
+
+        task = asyncio.create_task(adapter._build_ptb_requests())
+        heartbeats = 0
+        probe_seen = False
+        probe_finished_before_release = True
+        blocked_after_heartbeats = False
+        try:
+            deadline = time.monotonic() + 5
+            while not probe_entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            probe_seen = probe_entered.is_set()
+            probe_finished_before_release = probe_finished.is_set()
+            for _ in range(3):
+                await asyncio.sleep(0.01)
+                heartbeats += 1
+            blocked_after_heartbeats = not probe_finished.is_set()
+        finally:
+            probe_released.set()
+
+        try:
+            request, get_updates_request = await asyncio.wait_for(task, timeout=10)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+        assert probe_seen, "the cold proxy probe never ran"
+        assert not probe_finished_before_release
+        assert heartbeats == 3
+        assert blocked_after_heartbeats
+        assert request.kwargs.get("proxy") == "http://127.0.0.1:8080"
+        assert get_updates_request.kwargs.get("proxy") == "http://127.0.0.1:8080"
 

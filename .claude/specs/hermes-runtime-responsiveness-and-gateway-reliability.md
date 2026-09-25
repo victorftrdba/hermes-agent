@@ -28,6 +28,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 16. A missing, failed, hung, or repeatedly crashing cron child marks cron degraded and restarts with bounded backoff while Gateway health, control, Telegram, webhook, and conversation handling remain responsive. The Gateway never silently falls back to in-process cron execution.
 17. Shutdown disables new cron dispatch, reports child active-work status, waits within the configured drain budget, then terminates, kills if necessary, and reaps the cron child without blocking the Gateway event loop. External cron providers preserve their current provider and loopback-fire contracts.
 18. The idle async-delegation and process-notification watcher never reads, stats, expands, or parses gateway configuration on the event-loop thread. Environment/config mode changes remain observable without delaying webhook health, Telegram polling, or conversations.
+19. Telegram request construction and reconnect never execute the macOS system-proxy probe on the Gateway event-loop thread. Repeated proxy resolution shares a bounded process-wide probe result, including failures, while explicit environment precedence, `NO_PROXY`, `gateway.trust_env`, non-macOS behavior, and refresh after the bounded TTL remain unchanged.
 
 ## Non-goals
 
@@ -104,6 +105,14 @@ Move the built-in ticker, central-ledger access, recovery, due-job admission, ex
 
 Move notification-mode config loading out of the Gateway event loop for both the idle completion drain and per-process watcher. Preserve live environment/config reads and every existing notification mode while proving loop progress when the loader is deliberately blocked.
 
+### PR 9: macOS proxy probe isolation
+
+- `gateway/platforms/base.py`
+- `plugins/platforms/telegram/adapter.py`
+- `tests/gateway/test_proxy_mode.py`
+
+Cache only the macOS `scutil --proxy` result behind a short monotonic TTL, including failures, and move Telegram's unchanged proxy resolution call off the Gateway event loop. Preserve live environment and bypass evaluation outside the cache while proving that a blocked first probe cannot stall an independent loop heartbeat.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -126,6 +135,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 16 | `tests/cron/test_scheduler_process.py` crash, hung-child, exponential-backoff, degraded-health, and no-in-process-fallback cases plus `tests/cron/test_87033_cronjob_gateway_liveness.py` loop-progress coverage |
 | 17 | `tests/gateway/test_gateway_shutdown.py` and cron-process lifecycle tests prove dispatch pause, active-count drain, graceful exit, terminate/kill escalation, full reap, and unchanged external-provider startup/fire behavior |
 | 18 | `tests/gateway/test_background_process_notifications.py` blocks notification-mode loading and proves the Gateway event loop continues to advance for idle drains and per-process watchers |
+| 19 | `tests/gateway/test_proxy_mode.py` proves bounded success/failure caching, TTL/reset behavior, non-macOS no-fork behavior, and event-loop progress while Telegram request construction waits on a deliberately blocked system-proxy probe |
 
 ## Risks and mitigations
 
@@ -141,4 +151,5 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 - A cron child can die after claiming work or while the host is heavily swapped. Mitigation: durable claims and delivery queues, correlated admission responses, bounded restart backoff, fail-closed dispatch, and lifecycle tests across crash points.
 - Moving cron behind IPC can accidentally serialize live adapters or change external-provider semantics. Mitigation: keep adapters in the Gateway, keep delivery persistence in the child, exchange transport requests/results only, isolate the built-in provider, and retain existing external-provider paths under regression coverage.
 - Offloading notification-mode reads could reorder completion handling if launched without ownership. Mitigation: await one owned off-loop read at each existing call site, preserve watcher order, and add blocked-loader loop-progress tests.
+- A cached proxy can remain stale within its TTL, and an unbounded executor handoff could outlive request construction. Mitigation: cache only the operating-system probe for 60 seconds, keep environment and bypass checks live, await the owned thread result, expose a reset helper for deterministic refresh, and cover blocked-probe loop progress plus TTL/error refresh behavior.
 - The observed `35.8 GB` swap load can still slow any process after cron isolation. Mitigation: treat host pressure as an independent operational amplifier; acceptance requires eliminating Gateway-PID cron SQLite/GIL contention, not claiming that application code can repair system-wide swap exhaustion.
