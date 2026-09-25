@@ -243,11 +243,9 @@ def is_network_accessible(host: str) -> bool:
         return True
 
 
-def _detect_macos_system_proxy() -> str | None:
+def _probe_macos_system_proxy() -> str | None:
     """Read the macOS system HTTP(S) proxy via ``scutil --proxy``: ``http://host:port``
-    when an HTTP(S) proxy is enabled, else None (non-macOS or any subprocess error)."""
-    if sys.platform != "darwin":
-        return None
+    when an HTTP(S) proxy is enabled, else None (any subprocess error)."""
     try:
         out = subprocess.check_output(["scutil", "--proxy"], timeout=3, text=True, encoding='utf-8',
                                       errors='replace', stderr=subprocess.DEVNULL)
@@ -262,6 +260,38 @@ def _detect_macos_system_proxy() -> str | None:
         if props.get(enable_key) == "1" and props.get(host_key) and props.get(port_key):
             return f"http://{props[host_key]}:{props[port_key]}"
     return None
+
+
+_MACOS_SYSTEM_PROXY_CACHE_TTL = 60.0
+_macos_system_proxy_lock = threading.Lock()
+_macos_system_proxy_cache: "tuple[float, str | None] | None" = None
+
+
+def _detect_macos_system_proxy() -> str | None:
+    """``_probe_macos_system_proxy()`` behind a 60s process-wide monotonic cache — successes,
+    None and errors alike — with the lock held across a cold probe (single-flight): concurrent
+    callers wait instead of each forking ``scutil``. Non-macOS never forks. Nothing else from
+    ``resolve_proxy_url`` is cached: env vars and NO_PROXY stay live on every call."""
+    if sys.platform != "darwin":
+        return None
+    global _macos_system_proxy_cache
+    with _macos_system_proxy_lock:
+        now = time.monotonic()
+        if (_macos_system_proxy_cache is not None
+                and now - _macos_system_proxy_cache[0] < _MACOS_SYSTEM_PROXY_CACHE_TTL):
+            return _macos_system_proxy_cache[1]
+        value = _probe_macos_system_proxy()
+        _macos_system_proxy_cache = (time.monotonic(), value)
+        return value
+
+
+def reset_macos_system_proxy_cache() -> None:
+    """Drop the cached system-proxy probe (including a cached failure) so the next
+    ``_detect_macos_system_proxy()`` performs a live ``scutil`` read. Waits for an in-flight
+    probe so a reset can never be overwritten by an older result."""
+    global _macos_system_proxy_cache
+    with _macos_system_proxy_lock:
+        _macos_system_proxy_cache = None
 
 
 def _split_host_port(value: str) -> tuple[str, int | None]:

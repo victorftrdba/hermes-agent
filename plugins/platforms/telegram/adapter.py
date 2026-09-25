@@ -2758,7 +2758,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
-        proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips])
+        # Off-loop: a cold macOS system-proxy probe forks scutil and must never stall the Gateway loop.
+        proxy_url = await asyncio.to_thread(
+            resolve_proxy_url, "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips])
 
         def _pair(general_httpx: dict, updates_httpx: dict, **extra) -> tuple:
             return (HTTPXRequest(**request_kwargs, **extra, httpx_kwargs=general_httpx),
