@@ -4,6 +4,7 @@ api.telegram.org while TCP retries known IPv4 literals) plus DoH-based IP discov
 from __future__ import annotations
 
 import asyncio
+import importlib
 import ipaddress
 import logging
 import socket
@@ -202,70 +203,16 @@ def parse_fallback_ip_env(value: str | None) -> list[str]:
     return _normalize_fallback_ips(part.strip() for part in value.split(",")) if value else []
 
 
-def _resolve_system_dns() -> set[str]:
-    """Return the IPv4 addresses that the OS resolver gives for api.telegram.org."""
-    try:
-        results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
-        return {addr[4][0] for addr in results}
-    except Exception:
-        return set()
-
-
-async def _query_doh_provider(client: httpx.AsyncClient, provider: dict) -> list[str]:
-    """Query one DoH provider and return A-record IPs."""
-    try:
-        resp = await client.get(provider["url"], params=provider["params"], headers=provider["headers"])
-        resp.raise_for_status()
-        data = resp.json()
-        ips: list[str] = []
-        for answer in data.get("Answer", []):
-            if answer.get("type") != 1:  # A record
-                continue
-            raw = answer.get("data", "").strip()
-            try:
-                ipaddress.ip_address(raw)
-            except ValueError:
-                continue
-            ips.append(raw)
-        return ips
-    except Exception as exc:
-        logger.debug("DoH query to %s failed: %s", provider["url"], exc)
-        return []
-
-
 async def discover_fallback_ips() -> list[str]:
-    """Resolve api.telegram.org via Google + Cloudflare DoH; unique A records, in order. IPs matching the
-    system resolver are deliberately KEPT (often the most reliable path). Falls back to
-    ``SEED_FALLBACK_IPS`` only when DoH yields nothing usable.
-
-    IPs that match the local system resolver are kept rather than excluded: in many networks the system-DNS
-    IP is the most reliable path to api.telegram.org and a transient primary-path failure should be retried
-    against the same address via the IP-rewrite path before the seed list is consulted (#14520).
-    """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
-        system_dns_task = asyncio.ensure_future(asyncio.to_thread(_resolve_system_dns))
-        results = await asyncio.gather(*[_query_doh_provider(client, p) for p in _DOH_PROVIDERS], return_exceptions=True)
-    # The getaddrinfo leg has no timeout of its own and only feeds the log line below — bound it.
-    # The system-resolver leg runs socket.getaddrinfo in a worker thread with no timeout of its own — a
-    # wedged OS resolver (broken VPN/DNS) can sit for minutes. Its result only feeds the no-usable-answers
-    # log line below, so it must never gate discovery: bound it and move on (#63309). The DoH legs are
-    # already bounded by the client timeout above.
-    system_ips: set[str] = set()
-    try:
-        system_result = await asyncio.wait_for(system_dns_task, timeout=_DOH_TIMEOUT)
-        if isinstance(system_result, set):
-            system_ips = system_result
-    except Exception:
-        logger.debug("System-DNS resolution for %s did not complete in time", _TELEGRAM_API_HOST)
-    doh_ips = [ip for r in results if isinstance(r, list) for ip in r]
-    validated = _normalize_fallback_ips(list(dict.fromkeys(doh_ips)))  # dedupe, keep order
-    if validated:
-        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
-        return validated
-    logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
-        ", ".join(system_ips) or "unknown", ", ".join(SEED_FALLBACK_IPS))
-    return list(SEED_FALLBACK_IPS)
+    """Discover fallback IPs through the lazily loaded producer module."""
+    producer = importlib.import_module("plugins.platforms.telegram.telegram_discovery")
+    return await producer.discover_fallback_ips(
+        doh_timeout=_DOH_TIMEOUT,
+        doh_providers=_DOH_PROVIDERS,
+        seed_fallback_ips=SEED_FALLBACK_IPS,
+        normalize_fallback_ips=_normalize_fallback_ips,
+        telegram_api_host=_TELEGRAM_API_HOST,
+    )
 
 
 def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:

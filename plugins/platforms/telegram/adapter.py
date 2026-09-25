@@ -9,6 +9,7 @@ import logging
 import os
 import html as _html
 import re
+import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from hermes_cli import setup_platforms
 
 logger = logging.getLogger(__name__)
 
-from agent.deadline import run_bounded_async
+from agent.deadline import clamp_timeout, run_bounded_async, run_bounded_sync
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -74,6 +75,59 @@ async def _await_with_thread_deadline(awaitable, timeout: float, *, on_abandon=N
     if result.timed_out:
         raise asyncio.TimeoutError()
     return result.value
+
+
+async def _await_offloaded_sync(operation, timeout: float, *, label: str = "telegram-init"):
+    """Run a synchronous ``operation`` under a wall-clock deadline in a bounded worker thread.
+
+    ``operation`` creates and runs its own work (coroutine creation, lazy imports, client
+    construction, DNS) inside the worker, so none of it executes on the event-loop thread.
+    The deadline starts here, before the wrapper thread starts, so default-executor
+    saturation cannot delay it. Raises ``asyncio.TimeoutError`` on expiry; operation
+    exceptions propagate unchanged.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    timeout_s = clamp_timeout(timeout)
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+
+    def _publish(value=None, exc=None) -> None:
+        if future.done():
+            return
+        if exc is not None:
+            future.set_exception(exc)
+        else:
+            future.set_result(value)
+
+    def _deliver(value=None, exc=None) -> None:
+        try:
+            loop.call_soon_threadsafe(_publish, value, exc)
+        except RuntimeError:
+            pass
+
+    def _guarded_operation():
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise asyncio.TimeoutError()
+        return operation()
+
+    def _wrapper() -> None:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            _deliver(exc=asyncio.TimeoutError())
+            return
+        try:
+            result = run_bounded_sync(_guarded_operation, remaining, label=label)
+        except BaseException as exc:
+            _deliver(exc=exc)
+        else:
+            if result.timed_out:
+                _deliver(exc=asyncio.TimeoutError())
+            else:
+                _deliver(value=result.value)
+
+    threading.Thread(target=_wrapper, name=f"offload-{label}", daemon=True).start()
+    wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+    return await asyncio.wait_for(future, timeout=wait)
 
 
 def _iter_exception_graph(error: BaseException) -> "Iterator[BaseException]":
@@ -149,8 +203,11 @@ from gateway.platforms.base import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips,
+    parse_fallback_ip_env, tcp_keepalive_socket_options,
+)
 from utils import env_float, env_int
+
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 # Max seconds a send/edit may sleep inline on a flood-control RetryAfter; longer penalties fail
@@ -2744,20 +2801,23 @@ class TelegramAdapter(BasePlatformAdapter):
             return kwargs
 
         disable_fallback = os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"}
-        fallback_ips = [] if disable_fallback else self._fallback_ips()
-        if not fallback_ips and not disable_fallback:
+        fallback_ips = []
+        if not disable_fallback:
             discovery_timeout = self._env_float_clamped("HERMES_TELEGRAM_FALLBACK_DISCOVERY_TIMEOUT", 5.0, min_value=0.0)
-            logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
-            try:
-                fallback_ips = await _await_with_thread_deadline(discover_fallback_ips(), timeout=discovery_timeout)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Telegram fallback-IP discovery failed after %.0fs; "
-                    "using seed IPv4 Telegram API IPs so a blackholed IPv6 hostname path cannot hang initialize() (#87015): %s",
-                    self.name, discovery_timeout, _redact_telegram_error_text(exc))
-                fallback_ips = list(SEED_FALLBACK_IPS)
-            else:
-                logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
+            fallback_ips = self._fallback_ips()
+            if not fallback_ips:
+                logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
+                try:
+                    fallback_ips = await _await_offloaded_sync(
+                        lambda: asyncio.run(discover_fallback_ips()), timeout=discovery_timeout)
+                except Exception as exc:
+                    fallback_ips = list(SEED_FALLBACK_IPS)
+                    logger.warning(
+                        "[%s] Telegram fallback-IP discovery failed after %.0fs; "
+                        "using seed IPv4 Telegram API IPs so a blackholed IPv6 hostname path cannot hang initialize() (#87015): %s",
+                        self.name, discovery_timeout, _redact_telegram_error_text(exc))
+                else:
+                    logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
         # Off-loop: a cold macOS system-proxy probe forks scutil and must never stall the Gateway loop.
         proxy_url = await asyncio.to_thread(
             resolve_proxy_url, "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips])
