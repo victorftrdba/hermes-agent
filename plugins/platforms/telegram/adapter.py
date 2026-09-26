@@ -1751,12 +1751,17 @@ class TelegramAdapter(BasePlatformAdapter):
         return request
 
     def _connect_ownership_snapshot(self, app=None) -> tuple[Optional[int], Any]:
-        return self._connect_ownership_epoch, self._app if app is None else app
+        return (
+            getattr(self, '_connect_ownership_epoch', None),
+            getattr(self, '_app', None) if app is None else app,
+        )
 
     def _connect_ownership_is_current(self, epoch: Optional[int], app: Any) -> bool:
         if epoch is None:
-            return not self._teardown_started and (app is None or app is self._app)
-        key = self._connect_ownership_key
+            return not self._teardown_started and (
+                app is None or app is getattr(self, '_app', None)
+            )
+        key = getattr(self, '_connect_ownership_key', None)
         if key is None or app is None:
             return False
         with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
@@ -1766,8 +1771,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 and ownership.owner_ref() is self
                 and ownership.epoch == epoch
                 and ownership.app_id == id(app)
-                and self._connect_ownership_epoch == epoch
-                and self._connect_ownership_app_id == id(app)
+                and getattr(self, '_connect_ownership_epoch', None) == epoch
+                and getattr(self, '_connect_ownership_app_id', None) == id(app)
                 and not self._teardown_started
             )
 
@@ -1776,7 +1781,7 @@ class TelegramAdapter(BasePlatformAdapter):
             raise _PollingLifecycleAbort('Telegram connect ownership superseded')
 
     def _revoke_connect_ownership_locked(self, epoch: int, app: Any) -> None:
-        if self._connect_ownership_epoch != epoch:
+        if getattr(self, '_connect_ownership_epoch', None) != epoch:
             return
         self._connect_ownership_epoch = None
         self._connect_ownership_app_id = None
@@ -1836,7 +1841,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return epoch
 
     def _release_connect_ownership(self, epoch: Optional[int], app: Any) -> bool:
-        key = self._connect_ownership_key
+        key = getattr(self, '_connect_ownership_key', None)
         if key is None or epoch is None or app is None:
             return False
         with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
@@ -1849,7 +1854,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ):
                 return False
             del _TELEGRAM_CONNECT_OWNERS[key]
-            if self._connect_ownership_epoch == epoch:
+            if getattr(self, '_connect_ownership_epoch', None) == epoch:
                 self._connect_ownership_epoch = None
                 self._connect_ownership_app_id = None
             return True
@@ -3409,7 +3414,9 @@ class TelegramAdapter(BasePlatformAdapter):
         released_connect_ownership = self._release_connect_ownership(
             disconnect_epoch, disconnect_app
         )
-        if released_connect_ownership or not self._connect_ownership_had_claim:
+        if released_connect_ownership or not getattr(
+            self, '_connect_ownership_had_claim', False
+        ):
             self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
