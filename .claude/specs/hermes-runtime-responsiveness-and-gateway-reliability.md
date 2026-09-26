@@ -30,6 +30,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 18. The idle async-delegation and process-notification watcher never reads, stats, expands, or parses gateway configuration on the event-loop thread. Environment/config mode changes remain observable without delaying webhook health, Telegram polling, or conversations.
 19. Telegram request construction and reconnect never execute the macOS system-proxy probe on the Gateway event-loop thread. Repeated proxy resolution shares a bounded process-wide probe result, including failures, while explicit environment precedence, `NO_PROXY`, `gateway.trust_env`, non-macOS behavior, and refresh after the bounded TTL remain unchanged.
 20. Telegram adapter import may load transport primitives but never imports the separate discovery-producer module. Request construction runs the complete fallback-IP discovery producer — its lazy module import, coroutine creation, `AsyncClient` construction, DNS and DoH — off the Gateway event-loop thread and under one configured discovery deadline. Import, construction, and discovery errors or expiry fail closed to seed IPv4 via the existing fallback transport; configured and disabled fallback-IP behavior is unchanged.
+21. Within one process, only the newest Telegram adapter for a bot token may publish connected state or polling side effects. A cancellation-resistant predecessor is synchronously fenced, its PTB polling stop is armed, and its later completion or disconnect cannot revoke or degrade the replacement.
 
 ## Non-goals
 
@@ -148,6 +149,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 18 | `tests/gateway/test_background_process_notifications.py` blocks notification-mode loading and proves the Gateway event loop continues to advance for idle drains and per-process watchers |
 | 19 | `tests/gateway/test_proxy_mode.py` proves bounded success/failure caching, TTL/reset behavior, non-macOS no-fork behavior, and event-loop progress while Telegram request construction waits on a deliberately blocked system-proxy probe |
 | 20 | `tests/gateway/test_telegram_cold_network_import.py` proves adapter import excludes the discovery module and a blocked producer import leaves the loop responsive, then expires to seeded fallback transports; `tests/gateway/test_telegram_polling_progress.py` covers blocked discovery and normalized deadlines |
+| 21 | `tests/gateway/test_telegram_connect_ownership.py` overlaps two same-token connects, proves the successor arms the predecessor's PTB stop event, and verifies the stale completion and disconnect cannot publish health, enter fatal conflict, or release the replacement's ownership |
 
 ## Risks and mitigations
 

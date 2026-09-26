@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -11,6 +12,7 @@ import html as _html
 import re
 import threading
 import time
+import weakref
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -424,6 +426,31 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+@dataclasses.dataclass(frozen=True)
+class _TelegramConnectOwnership:
+    owner_ref: weakref.ReferenceType
+    epoch: int
+    app_id: int
+
+
+_TELEGRAM_CONNECT_OWNERSHIP_LOCK = threading.Lock()
+_TELEGRAM_CONNECT_OWNERS: Dict[bytes, _TelegramConnectOwnership] = {}
+_TELEGRAM_CONNECT_EPOCH = 0
+
+
+def _finalize_connect_ownership(
+    key: bytes, epoch: int, owner_ref: weakref.ReferenceType
+) -> None:
+    with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
+        ownership = _TELEGRAM_CONNECT_OWNERS.get(key)
+        if (
+            ownership
+            and ownership.epoch == epoch
+            and ownership.owner_ref is owner_ref
+        ):
+            del _TELEGRAM_CONNECT_OWNERS[key]
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -525,6 +552,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
         self._bot_identity_refresh_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
+        self._connect_ownership_key: Optional[bytes] = None
+        self._connect_ownership_epoch: Optional[int] = None
+        self._connect_ownership_app_id: Optional[int] = None
+        self._connect_ownership_had_claim = False
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_progress_event = asyncio.Event()
@@ -1719,13 +1750,142 @@ class TelegramAdapter(BasePlatformAdapter):
         request.__class__ = _InstrumentedPollingRequest
         return request
 
+    def _connect_ownership_snapshot(self, app=None) -> tuple[Optional[int], Any]:
+        return self._connect_ownership_epoch, self._app if app is None else app
+
+    def _connect_ownership_is_current(self, epoch: Optional[int], app: Any) -> bool:
+        if epoch is None:
+            return not self._teardown_started and (app is None or app is self._app)
+        key = self._connect_ownership_key
+        if key is None or app is None:
+            return False
+        with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
+            ownership = _TELEGRAM_CONNECT_OWNERS.get(key)
+            return bool(
+                ownership
+                and ownership.owner_ref() is self
+                and ownership.epoch == epoch
+                and ownership.app_id == id(app)
+                and self._connect_ownership_epoch == epoch
+                and self._connect_ownership_app_id == id(app)
+                and not self._teardown_started
+            )
+
+    def _assert_connect_ownership(self, epoch: Optional[int], app: Any) -> None:
+        if not self._connect_ownership_is_current(epoch, app):
+            raise _PollingLifecycleAbort('Telegram connect ownership superseded')
+
+    def _revoke_connect_ownership_locked(self, epoch: int, app: Any) -> None:
+        if self._connect_ownership_epoch != epoch:
+            return
+        self._connect_ownership_epoch = None
+        self._connect_ownership_app_id = None
+        self._polling_teardown_started = True
+        self._polling_progress_accepting = False
+        self._polling_generation = getattr(self, '_polling_generation', 0) + 1
+        self._polling_progress_event = asyncio.Event()
+        self._send_path_degraded = True
+        self._mark_disconnected()
+        for attr in (
+            '_polling_error_task',
+            '_polling_progress_verifier_task',
+            '_polling_heartbeat_task',
+            '_bot_identity_refresh_task',
+            '_post_connect_task',
+        ):
+            task = getattr(self, attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+        self._disarm_ptb_retry_loop_for_app(app)
+
+    def _claim_connect_ownership(self, app: Any) -> int:
+        global _TELEGRAM_CONNECT_EPOCH
+        token = self.config.token
+        if not token:
+            raise _PollingLifecycleAbort('Telegram connect ownership requires a token')
+        key = hashlib.sha256(token.encode('utf-8')).digest()
+        abandoned_app = None
+        with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
+            previous = _TELEGRAM_CONNECT_OWNERS.get(key)
+            previous_owner = previous.owner_ref() if previous else None
+            if previous and previous_owner is not None and (
+                previous_owner is not self or previous.app_id != id(app)
+            ):
+                candidate = getattr(previous_owner, '_app', None)
+                if candidate is not None and id(candidate) == previous.app_id:
+                    abandoned_app = candidate
+                previous_owner._revoke_connect_ownership_locked(previous.epoch, abandoned_app)
+            _TELEGRAM_CONNECT_EPOCH += 1
+            epoch = _TELEGRAM_CONNECT_EPOCH
+            self._connect_ownership_key = key
+            self._connect_ownership_epoch = epoch
+            self._connect_ownership_app_id = id(app)
+            self._connect_ownership_had_claim = True
+            self._polling_teardown_started = False
+            owner_ref = weakref.ref(
+                self,
+                lambda dead_ref, key=key, epoch=epoch: _finalize_connect_ownership(
+                    key, epoch, dead_ref
+                ),
+            )
+            _TELEGRAM_CONNECT_OWNERS[key] = _TelegramConnectOwnership(
+                owner_ref, epoch, id(app)
+            )
+        if abandoned_app is not None:
+            self._schedule_abandoned_app_cleanup(abandoned_app)
+        return epoch
+
+    def _release_connect_ownership(self, epoch: Optional[int], app: Any) -> bool:
+        key = self._connect_ownership_key
+        if key is None or epoch is None or app is None:
+            return False
+        with _TELEGRAM_CONNECT_OWNERSHIP_LOCK:
+            ownership = _TELEGRAM_CONNECT_OWNERS.get(key)
+            if not (
+                ownership
+                and ownership.owner_ref() is self
+                and ownership.epoch == epoch
+                and ownership.app_id == id(app)
+            ):
+                return False
+            del _TELEGRAM_CONNECT_OWNERS[key]
+            if self._connect_ownership_epoch == epoch:
+                self._connect_ownership_epoch = None
+                self._connect_ownership_app_id = None
+            return True
+
+    def _schedule_abandoned_app_cleanup(self, app: Any) -> None:
+        task = asyncio.get_running_loop().create_task(self._cleanup_abandoned_app(app))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(_consume_abandoned_task)
+
+    async def _cleanup_abandoned_app(self, app: Any) -> None:
+        updater = getattr(app, 'updater', None)
+        if updater is not None and getattr(updater, 'running', False):
+            with contextlib.suppress(Exception):
+                await self._await_disconnect_step(
+                    updater.stop(), _UPDATER_STOP_TIMEOUT, 'superseded updater.stop()'
+                )
+        if getattr(app, 'running', False):
+            with contextlib.suppress(Exception):
+                await self._await_disconnect_step(
+                    app.stop(), _DISCONNECT_STEP_TIMEOUT, 'superseded app.stop()'
+                )
+        with contextlib.suppress(Exception):
+            await self._await_disconnect_step(
+                app.shutdown(), _DISCONNECT_STEP_TIMEOUT, 'superseded app.shutdown()'
+            )
+
     async def _start_polling_once(
         self, app, *, drop_pending_updates: bool, error_callback, abandon_app_on_timeout: bool = False,
         schedule_verifier: bool = True) -> tuple[int, asyncio.Event]:
         """Start one generation and verify real getUpdates progress. Returns this generation's
         ``(generation, progress_event)`` so readiness-gating callers bind to exactly it."""
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot(app)
         if self._teardown_started:
             raise _PollingLifecycleAbort("Telegram polling teardown started")
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         generation, progress = self._begin_polling_generation()
         if not self._polling_progress_accepting:
             raise _PollingLifecycleAbort("Telegram polling teardown started")
@@ -1743,6 +1903,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # asyncio.wait_for can wait forever on httpcore/AnyIO shielded scopes; use the wall-deadline
             # helper and abandon the partial updater (caller rebuilds).
+            self._assert_connect_ownership(ownership_epoch, ownership_app)
             await _await_with_thread_deadline(
                 app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES, drop_pending_updates=drop_pending_updates, error_callback=_generation_error_callback),
@@ -1750,6 +1911,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 on_abandon=((lambda app=app: _shutdown_abandoned_app(app)) if abandon_app_on_timeout else None))
         finally:
             _POLLING_GENERATION_CONTEXT.reset(context_token)
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         if self._teardown_started:
             self._fence_polling()
             raise _PollingLifecycleAbort("Telegram polling teardown started")
@@ -2040,6 +2202,7 @@ class TelegramAdapter(BasePlatformAdapter):
         ``error_callback`` never fires. Probe ``get_me()`` on the *general* path (never the getUpdates pool);
         connect-level failures feed ``_handle_polling_network_error``. Runs for the connection's lifetime, catching
         steady-state wedges the one-shot verifier can't."""
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot()
         HEARTBEAT_INTERVAL = 90   # seconds between probes
         PROBE_TIMEOUT = 15        # seconds before declaring the path dead
         # Wedged-recovery watchdog: note when a recovery task is first seen in-flight and force-escalate
@@ -2054,7 +2217,11 @@ class TelegramAdapter(BasePlatformAdapter):
         while True:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
-                if self._teardown_started or self.has_fatal_error:
+                if (
+                    not self._connect_ownership_is_current(ownership_epoch, ownership_app)
+                    or self._teardown_started
+                    or self.has_fatal_error
+                ):
                     return
                 # A recovery task hung on an unbounded await gates every other recovery path forever
                 # (alive but deaf): force retryable-fatal so the reconnector rebuilds the adapter.
@@ -2090,6 +2257,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not callable(getattr(bot, "get_me", None)):
                     return
                 await asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)
+                if not self._connect_ownership_is_current(ownership_epoch, ownership_app):
+                    return
                 # get_me() refreshes PTB's cached bot user: adopt a BotFather rename before routing on it.
                 self._bot_identity_checked_at = time.monotonic()
                 self._note_bot_username(getattr(bot, "username", None))
@@ -2101,11 +2270,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 # two consecutive probes see a non-zero queue while we believe we're polling, so a single
                 # in-flight update (consumed before the next probe) never trips recovery.
                 await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                if not self._connect_ownership_is_current(ownership_epoch, ownership_app):
+                    return
                 # An empty queue can't hide a wedge forever: no round-trip past the stall threshold ⇒ dead.
                 # Even an empty queue cannot hide a wedged long-poll forever: Telegram answers within ~50s,
                 # so a consumer with no successful round-trip past the stall threshold is dead (#92991).
                 # Pure local-state check — no Bot API call needed.
                 await self._check_polling_stall()
+                if not self._connect_ownership_is_current(ownership_epoch, ownership_app):
+                    return
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
@@ -2274,7 +2447,10 @@ class TelegramAdapter(BasePlatformAdapter):
         private ``stop_event`` makes its loop exit on the next tick; ``updater.stop()`` + drain + ``start_polling()`` then build
         a fresh one. Best-effort across PTB spellings. Deliberately NOT flipping ``updater._running``: stop() raises when
         already False, which would skip the real teardown and poison the next start."""
-        updater = getattr(self._app, "updater", None) if self._app else None
+        self._disarm_ptb_retry_loop_for_app(self._app)
+
+    def _disarm_ptb_retry_loop_for_app(self, app: Any) -> None:
+        updater = getattr(app, 'updater', None) if app else None
         if updater is None:
             return
         for attr in ("_Updater__polling_task_stop_event", "_polling_task_stop_event"):
@@ -2572,6 +2748,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _start_post_connect_housekeeping(self) -> None:
         """Kick off deferred post-connect housekeeping; idempotent while a task is still running."""
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot()
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         task = self._post_connect_task
         if task and not task.done():
             return
@@ -2580,6 +2758,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _register_command_menu(self) -> None:
         """Register the command menu (from COMMAND_REGISTRY) in every scope — Telegram picks the
         narrowest matching one per chat type; forum topics are handled lazily by _ensure_forum_commands."""
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot()
         from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault
         from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
         if not self._bot:
@@ -2590,12 +2769,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # scan cannot starve polling/heartbeats for its whole duration.
         menu_commands, hidden_count = await asyncio.to_thread(
             telegram_menu_commands, max_commands=max_commands)
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
         for scope_cls in (BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats):
             scope_name = getattr(scope_cls, "__name__", str(scope_cls))
             try:
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
                 await self._bot.set_my_commands(bot_commands, scope=scope_cls())
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
                 logger.info("[%s] set_my_commands OK for scope %s (%d cmds)", self.name, scope_name, len(bot_commands))
+            except _PollingLifecycleAbort:
+                raise
             except Exception as scope_err:
                 logger.warning("[%s] set_my_commands FAILED for scope %s: %s", self.name, scope_name, scope_err)
         if hidden_count:
@@ -2609,18 +2793,35 @@ class TelegramAdapter(BasePlatformAdapter):
         DM topics — all off the connect path so a slow Bot API call cannot blow the gateway connect timeout
         (#46298).
         """
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot()
         try:
+            self._assert_connect_ownership(ownership_epoch, ownership_app)
             try:
                 await self._register_command_menu()
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
+            except _PollingLifecycleAbort:
+                raise
             except Exception as e:
                 logger.warning(
                     "[%s] Could not register Telegram command menu: %s", self.name, _redact_telegram_error_text(e), exc_info=True)
-            with contextlib.suppress(Exception):
-                await self._set_status_indicator(online=True)
             try:
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
+                await self._set_status_indicator(online=True)
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
+            except _PollingLifecycleAbort:
+                raise
+            except Exception:
+                pass
+            try:
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
                 await self._setup_dm_topics()
+                self._assert_connect_ownership(ownership_epoch, ownership_app)
+            except _PollingLifecycleAbort:
+                raise
             except Exception as topics_err:
                 logger.warning("[%s] DM topics setup failed (non-fatal): %s", self.name, topics_err, exc_info=True)
+        except _PollingLifecycleAbort:
+            return
         except asyncio.CancelledError:
             raise
         finally:
@@ -2948,8 +3149,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _start_polling_mode(self, *, is_reconnect: bool) -> None:
         """Clear any stale webhook and start resilient long polling."""
+        ownership_epoch, ownership_app = self._connect_ownership_snapshot()
         # Best-effort: a transient Bot API error must not fail gateway startup — degrade to recovery.
         await self._delete_webhook_best_effort(require_success=not is_reconnect)
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         loop = asyncio.get_running_loop()
 
         def _polling_error_callback(error: Exception) -> None:
@@ -2970,6 +3173,7 @@ class TelegramAdapter(BasePlatformAdapter):
         polling_started = await self._start_polling_resilient(
             # Cold first boot drops the stale Bot API queue; a watcher reconnect preserves it.
             drop_pending_updates=not is_reconnect, error_callback=_polling_error_callback, require_progress=not is_reconnect)
+        self._assert_connect_ownership(ownership_epoch, ownership_app)
         if not polling_started:
             logger.warning(
                 "[%s] Connected in degraded Telegram mode: gateway is alive, polling will be retried in the background", self.name)
@@ -2983,6 +3187,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Explicit connect() is the only operation allowed to reopen polling after a completed teardown.
         self._polling_teardown_started = False
         self._webhook_mode = False  # re-evaluated on every explicit connection
+        connect_epoch: Optional[int] = None
+        connect_app = None
         if not TELEGRAM_AVAILABLE:
             logger.error("[%s] python-telegram-bot not installed. Run: pip install python-telegram-bot", self.name)
             self._set_fatal_error("missing_dependency", "python-telegram-bot not installed", retryable=False)
@@ -3008,17 +3214,22 @@ class TelegramAdapter(BasePlatformAdapter):
             request, get_updates_request = await self._build_ptb_requests()
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
+            connect_app = self._app
+            connect_epoch = self._claim_connect_ownership(connect_app)
             self._bot = self._app.bot
             # Plugin PTB handlers go BEFORE core: PTB dispatches the first matching handler per group.
             self._wire_plugin_handlers(self._app)
             self._register_handlers(self._app)
             await self._initialize_app_with_retries(builder)
+            self._assert_connect_ownership(connect_epoch, connect_app)
             await self._app.start()
+            self._assert_connect_ownership(connect_epoch, connect_app)
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
             if webhook_url:
                 await self._start_webhook_mode(webhook_url, is_reconnect=is_reconnect)
             else:
                 await self._start_polling_mode(is_reconnect=is_reconnect)
+            self._assert_connect_ownership(connect_epoch, connect_app)
             self._mark_connected()
             # WARNING, not INFO: "Connecting…" above is WARNING and reaches the terminal; an INFO success
             # line made healthy startups look stalled at "attempt 1/8".
@@ -3031,12 +3242,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # sides of the connect transition must share a terminal-visible level so a real hang is the
             # *absence* of this line, not ambiguity.
             if not self._webhook_mode:
+                self._assert_connect_ownership(connect_epoch, connect_app)
                 self._restart_task_attr("_polling_heartbeat_task", self._polling_heartbeat_loop())
             # Seed the live identity from PTB's initialize() cache; polling rides the heartbeat's get_me(),
             # webhook mode gets a low-frequency refresh loop (else a BotFather rename breaks routing).
             self._note_bot_username(getattr(self._bot, "username", None))
             self._bot_identity_checked_at = time.monotonic()
             if self._webhook_mode:
+                self._assert_connect_ownership(connect_epoch, connect_app)
                 self._restart_task_attr("_bot_identity_refresh_task", self._bot_identity_refresh_loop())
             # Command menu / DM topics / status indicator can stall for some tokens: defer to a cancellable
             # task so one slow call can't sink the (gateway-timed) connect while transport is live.
@@ -3044,10 +3257,17 @@ class TelegramAdapter(BasePlatformAdapter):
             # that can stall for certain tokens. Running them here — inside the connect() coroutine that the
             # gateway wraps in a connect timeout — means one slow call blows the whole connect and the
             # adapter never comes up, even though polling/webhook is already live (#46298).
+            self._assert_connect_ownership(connect_epoch, connect_app)
             self._start_post_connect_housekeeping()
             return True
+        except _PollingLifecycleAbort:
+            return False
         except Exception as e:
-            self._release_platform_lock()
+            if connect_epoch is not None and not self._connect_ownership_is_current(connect_epoch, connect_app):
+                return False
+            released = self._release_connect_ownership(connect_epoch, connect_app)
+            if connect_epoch is None or released:
+                self._release_platform_lock()
             safe_error = _redact_telegram_error_text(e)
             # Classify by exception TYPE (never message text): auth failures can never self-heal, so
             # marking them retryable put agents into a silent eternal reconnect loop.
@@ -3175,6 +3395,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+        disconnect_epoch, disconnect_app = self._connect_ownership_snapshot()
         # Mark disconnected first so the drop guard short-circuits any flush that wins the race.
         self._mark_disconnected()
         self._polling_teardown_started = True
@@ -3182,9 +3403,14 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_generation = getattr(self, "_polling_generation", 0) + 1
         self._polling_progress_event = asyncio.Event()
         self._send_path_degraded = True
+        self._disarm_ptb_retry_loop_for_app(disconnect_app)
         # Release the bot-token lock immediately so a wedged close cannot block the reconnect watcher.
         # The rest of teardown is best-effort against a half-dead transport. See #80598.
-        self._release_platform_lock()
+        released_connect_ownership = self._release_connect_ownership(
+            disconnect_epoch, disconnect_app
+        )
+        if released_connect_ownership or not self._connect_ownership_had_claim:
+            self._release_platform_lock()
         # Cancel and await both polling lifecycle owners right after the fence, before any other teardown
         # await lets them start a new generation.
         current_task = asyncio.current_task()
