@@ -33,6 +33,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 21. Within one process, only the newest Telegram adapter for a bot token may publish connected state or polling side effects. A cancellation-resistant predecessor is synchronously fenced, its PTB polling stop is armed, and its later completion or disconnect cannot revoke or degrade the replacement.
 22. The startup-liveness watchdog arms only in the primary process. A `multiprocessing` child that inherits a `gateway run` argv (cron child, SessionDB bootstrap, any spawn worker) must not arm its own watchdog, while the primary-process path still arms before the heavy import graph. Process identity comes from `multiprocessing.current_process().name`, never `__name__` alone, on both the console-script and direct-module entry paths.
 23. The desktop in-process cron ticker passes `profile_homes` and the dynamic per-tick `profile_gate` whenever `profiles_to_serve(multiplex=True)` returns one or more profiles, single-profile included: a profile whose own gateway is live owns its ticks, and the desktop resumes that profile when the gateway later stops. External cron providers and profile-enumeration failure keep their current single-store behavior.
+24. Gateway-owned executor dispatch is lock-free and never blocks the asyncio event loop on a lifecycle mutex. The pool is created once at construction, and shutdown sets its one-way closing gate and detaches it before the bounded drain, so a late submit fails fast instead of resurrecting a pool over the closing `SessionDB`. Heartbeat watch restoration preserves the routing index and live watches and retries on the next poll after a rejected dispatch.
 
 ## Non-goals
 
@@ -136,6 +137,17 @@ Keep transport primitives in the eagerly imported network module and isolate the
 
 Gate the early gateway-run watchdog arm on primary-process identity so multiprocessing children cannot arm a watchdog from inherited argv, and extend the desktop builtin ticker's `profile_homes` + dynamic `profile_gate` to the single-profile case so a profile is skipped while its own gateway is live and resumed once it stops.
 
+### PR 12: Gateway executor dispatch and shutdown quiesce
+
+- `gateway/run.py`
+- `tests/gateway/test_shutdown_executor_quiesce.py`
+- `tests/gateway/test_heartbeat_watch_restore.py`
+- `tests/gateway/test_compress_command.py`
+- `tests/gateway/test_session_env.py`
+- `tests/gateway/test_slash_command_profile_scope.py`
+
+Create the single gateway-owned executor eagerly at construction and remove the lifecycle mutex from executor access so dispatch cannot wait behind a thread parked in the old critical section. Gate and detach the pool before draining it, and join running workers within the bounded drain before `SessionDB.close()` so a late submit cannot resurrect work. Leave heartbeat watch restoration's index and live watches untouched on a rejected dispatch so the next poll retries with the pool attached, and keep runner fixtures constructing the stable pool.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -163,6 +175,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 21 | `tests/gateway/test_telegram_connect_ownership.py` overlaps two same-token connects, proves the successor arms the predecessor's PTB stop event, and verifies the stale completion and disconnect cannot publish health, enter fatal conflict, or release the replacement's ownership |
 | 22 | `tests/gateway/test_startup_watchdog.py` proves a spawned child given `gateway run` argv stays unarmed while the MainProcess path still arms |
 | 23 | `tests/hermes_cli/test_desktop_cron_ticker_profiles.py` proves the single-profile desktop builtin receives `profile_homes` and a gate that rejects a live own gateway and accepts once it stops; external-provider and enumeration-failure behavior unchanged |
+| 24 | `tests/gateway/test_shutdown_executor_quiesce.py` proves a holder of the removed legacy lock cannot delay a dispatch, and that shutdown detaches the pool and refuses new work before `SessionDB` close; `tests/gateway/test_heartbeat_watch_restore.py` proves a rejected dispatch leaves the routing index and live watches intact and the next attached poll restores them; `tests/gateway/test_compress_command.py`, `tests/gateway/test_session_env.py`, and `tests/gateway/test_slash_command_profile_scope.py` construct the stable pool and shut it down |
 
 ## Risks and mitigations
 
@@ -181,3 +194,4 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 - A cached proxy can remain stale within its TTL, and an unbounded executor handoff could outlive request construction. Mitigation: cache only the operating-system probe for 60 seconds, keep environment and bypass checks live, await the owned thread result, expose a reset helper for deterministic refresh, and cover blocked-probe loop progress plus TTL/error refresh behavior.
 - Running the fallback-discovery producer inside an off-loop worker moves coroutine creation and imports into that thread and changes where discovery raises. Mitigation: bridge the bounded worker with `run_bounded_sync`, raise `asyncio.TimeoutError` on expiry so the unchanged seed-fallback branch runs, re-raise operation exceptions, and prove an independent heartbeat advances while a synchronously blocked producer is awaited.
 - The observed `35.8 GB` swap load can still slow any process after cron isolation. Mitigation: treat host pressure as an independent operational amplifier; acceptance requires eliminating Gateway-PID cron SQLite/GIL contention, not claiming that application code can repair system-wide swap exhaustion.
+- A submit can race shutdown: a caller that resolves the executor just before the closing gate could still queue work onto the pool while `SessionDB.close()` runs. Mitigation: keep the pool's own `ThreadPoolExecutor` synchronization as the only executor state (eager single pool, one-way closing gate set and pool detached before draining), join running workers within the bounded drain, and close `SessionDB` only after the drain returns.

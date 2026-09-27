@@ -62,7 +62,6 @@ class _FakeGateway:
         self._pending_messages = {}
         self._pending_approvals = {}
         self._busy_ack_ts = {}
-        self._executor_lock = threading.Lock()
         self._executor_closing = False
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="quiesce-test"
@@ -169,6 +168,44 @@ async def test_executor_refuses_new_work_before_session_db_close():
     assert "closing_flag:True" in events, events
     with pytest.raises(RuntimeError):
         gw_mod.GatewayRunner._get_executor(gw)
+    assert gw._executor is None, "shutdown must not leave a pool to resurrect"
+
+
+@pytest.mark.asyncio
+async def test_legacy_executor_lock_held_elsewhere_cannot_block_a_dispatch():
+    """The old lock-based gate is gone; a stale ``_executor_lock`` never blocks dispatch.
+
+    ``_get_executor``/``_shutdown_executor`` used to serialize on ``self._executor_lock``. A thread
+    parked in that critical section therefore stalled every ``_run_in_executor_with_context`` caller
+    (heartbeat watch restore included). The stable eagerly-created pool reads no lock at all.
+    """
+    gw = _FakeGateway([])
+    gw._executor_lock = threading.Lock()
+    gw._get_executor = lambda: gw_mod.GatewayRunner._get_executor(gw)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def _hold_legacy_lock():
+        with gw._executor_lock:
+            lock_held.set()
+            # Hard cap so a regression that does block on the lock still unwinds and fails on
+            # elapsed time instead of wedging the suite forever.
+            release_lock.wait(5.0)
+
+    holder = threading.Thread(target=_hold_legacy_lock, daemon=True)
+    holder.start()
+    assert lock_held.wait(2.0), "legacy lock holder never acquired the lock"
+
+    try:
+        began = time.monotonic()
+        ident = await gw_mod.GatewayRunner._run_in_executor_with_context(gw, threading.get_ident)
+        elapsed = time.monotonic() - began
+    finally:
+        release_lock.set()
+        holder.join(timeout=5)
+
+    assert elapsed < 1.0, f"dispatch waited {elapsed:.2f}s behind the legacy lock"
+    assert ident != threading.get_ident()
 
 
 @pytest.mark.asyncio

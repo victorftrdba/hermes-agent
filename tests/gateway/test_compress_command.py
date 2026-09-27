@@ -1,6 +1,7 @@
 """Tests for gateway /compress user-facing messaging."""
 
 import asyncio
+import concurrent.futures
 import threading
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -39,6 +40,9 @@ def _make_runner(history: list[dict[str, str]]):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    runner._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=10, thread_name_prefix="hermes-gateway")
+    runner._executor_closing = False
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -102,6 +106,7 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     assert "Compressed:" in result
     agent_instance._compress_context.assert_called_once()
     assert agent_instance._compress_context.call_args.kwargs.get("force") is True
+    runner._shutdown_executor()
 
 
 @pytest.mark.asyncio
@@ -168,6 +173,7 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     assert "intact" in result
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
+    runner._shutdown_executor()
 
 
 @pytest.mark.asyncio
@@ -224,6 +230,7 @@ async def test_compress_command_in_place_skips_destructive_rewrite():
     assert session_entry.session_id == "sess-1"
     agent_instance.shutdown_memory_provider.assert_called_once()
     agent_instance.close.assert_called_once()
+    runner._shutdown_executor()
 
 
 @pytest.mark.asyncio
@@ -261,6 +268,7 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     # Stable gateway session key preserved, identical to a normal gateway turn.
     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
     assert kwargs["gateway_session_key"]
+    runner._shutdown_executor()
 
 
 @pytest.mark.asyncio
@@ -294,13 +302,16 @@ async def test_compress_command_passes_tool_messages_to_compressor():
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (list(history), "")
 
-    with (
-        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
-        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-        patch("run_agent.AIAgent", return_value=agent_instance),
-        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
-    ):
-        await runner._handle_compress_command(_make_event())
+    try:
+        with (
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("run_agent.AIAgent", return_value=agent_instance),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        ):
+            await runner._handle_compress_command(_make_event())
+    finally:
+        runner._shutdown_executor()
 
     args, _kwargs = agent_instance._compress_context.call_args
     passed = args[0]

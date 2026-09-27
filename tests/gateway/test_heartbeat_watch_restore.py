@@ -1,5 +1,7 @@
-"""Restart recovery uses current routing and never borrows another profile's heartbeat."""
+"""Restart recovery uses current routing, survives a failed dispatch, and never borrows another profile's heartbeat."""
 import asyncio
+import concurrent.futures
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -103,3 +105,72 @@ async def test_startup_arms_retry_poller_even_without_any_watches(monkeypatch):
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failed_restore_dispatch_leaves_watches_for_the_next_poll(tmp_path, monkeypatch):
+    """A dispatch that cannot reach the pool retries next poll and never prunes watches.
+
+    ``_get_executor`` raises while the pool is detached instead of minting a replacement, so a failed
+    restore dispatch must leave the persisted routing index and any live watches untouched; the next
+    poll with the pool attached restores them.
+    """
+    from gateway.run_heartbeat_restore import restore_heartbeat_watches
+
+    home = tmp_path / '.hermes'
+    home.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    db = SessionDB(db_path=home / 'state.db')
+    monkeypatch.setattr(goals, '_DB_CACHE', {str(home): db})
+    config = GatewayConfig()
+    store = SessionStore(home / 'sessions', config)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='chat', thread_id='7',
+                           scope_id='workspace')
+    with _profile_runtime_scope(home):
+        entry = store.get_or_create_session(source)
+        HeartbeatManager(entry.session_id).set('check', 60)
+    store.close_all_db_handles()
+
+    scan_ran = threading.Event()
+    kept_source = SessionSource(platform=Platform.TELEGRAM, chat_id='kept', thread_id='9',
+                                scope_id='workspace')
+    kept_watch = (kept_source, 'kept-session')
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = config
+    runner.session_store = SessionStore(home / 'sessions', config)
+    runner._heartbeat_watch = {'kept': kept_watch}
+    runner._start_heartbeat_poller = lambda: None
+    runner._profile_name_for_source = lambda source: source.profile
+    runner._adapter_for_source = lambda source: object()
+    runner._executor_closing = False
+    runner._executor = None
+    listed = runner.session_store.list_sessions
+
+    def _listing():
+        scan_ran.set()
+        return listed()
+
+    runner.session_store.list_sessions = _listing
+
+    try:
+        await restore_heartbeat_watches(runner)
+
+        assert not scan_ran.is_set(), "the failed dispatch still reached the scan"
+        assert runner._heartbeat_watch == {'kept': kept_watch}
+        assert runner._executor is None, "the failed dispatch minted a replacement pool"
+
+        runner._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='heartbeat-restore-test')
+        await restore_heartbeat_watches(runner)
+
+        assert scan_ran.is_set(), "the retried dispatch never reached the scan"
+        assert runner._heartbeat_watch == {
+            'kept': kept_watch,
+            entry.session_key: (entry.origin, entry.session_id),
+        }
+    finally:
+        if runner._executor is not None:
+            runner._executor.shutdown(wait=True)
+        runner.session_store.close_all_db_handles()
+        db.close()

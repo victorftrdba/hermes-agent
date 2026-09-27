@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import os
 
 import pytest
@@ -196,6 +197,9 @@ def test_session_key_no_race_condition_with_contextvars(monkeypatch):
 async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
     """Gateway executor work should inherit session contextvars for tool routing."""
     runner = object.__new__(GatewayRunner)
+    runner._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=10, thread_name_prefix="hermes-gateway")
+    runner._executor_closing = False
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
