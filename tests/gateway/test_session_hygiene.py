@@ -1669,8 +1669,11 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     from hermes_state import SessionDB
 
     worker_started = threading.Event()
+    worker_finished = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
+    cancel_result = None
+    cancelled_at = None
     session_id = "sess-fence-wait"
 
     class HungAfterFenceCancelAgent:
@@ -1692,19 +1695,24 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
-            if commit_fence is not None:
-                commit_fence.try_cancel_before_commit()
-            worker_started.set()
-            # Keep the worker alive (and keep reporting "progress") so a
-            # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
+            nonlocal cancel_result, cancelled_at
+            try:
                 if commit_fence is not None:
-                    commit_fence.touch_progress()
-                if release_worker.is_set():
-                    break
-                time.sleep(0.02)
-            return (messages, None)
+                    cancel_result = commit_fence.try_cancel_before_commit()
+                    cancelled_at = time.monotonic()
+                worker_started.set()
+                # Keep the worker alive (and keep reporting "progress") so a
+                # host that still extends to the 600s ceiling would stall here.
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if commit_fence is not None:
+                        commit_fence.touch_progress()
+                    if release_worker.is_set():
+                        break
+                    time.sleep(0.02)
+                return (messages, None)
+            finally:
+                worker_finished.set()
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -1713,24 +1721,40 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
             monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id,
             attach_gateway_executor=attach_gateway_executor,
         )
-        started = time.monotonic()
-        result = await runner._handle_message(event)
-        elapsed = time.monotonic() - started
+        try:
+            result = await runner._handle_message(event)
+            returned_at = time.monotonic()
+            worker_was_finished = worker_finished.is_set()
+            cleanup_was_done = cleanup_done.is_set()
 
-        assert result == "ok"
-        assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
-            f"hygiene host waited {elapsed:.1f}s after fence cancel — "
-            "must not extend toward the 600s ceiling (#96953)"
-        )
-        assert runner._run_agent.await_count == 1
-        state = db.get_compression_failure_cooldown(session_id)
-        assert state is not None and state["remaining_seconds"] > 0
-        assert not any(
-            "Context compression timed out" in s["content"] for s in adapter.sent
-        ), "fence-cancel is not a summary-model timeout; no timeout toast"
-        release_worker.set()
-        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+            assert result == "ok"
+            assert worker_started.wait(timeout=2)
+            assert cancel_result is True
+            assert cancelled_at is not None
+            elapsed = returned_at - cancelled_at
+            assert not worker_was_finished, (
+                "hygiene host waited for cancelled worker to finish (#96953)"
+            )
+            assert not cleanup_was_done, (
+                "hygiene host waited for cancelled worker cleanup (#96953)"
+            )
+            assert elapsed < 2.0, (
+                f"hygiene host waited {elapsed:.1f}s after fence cancel — "
+                "must not extend toward the 600s ceiling (#96953)"
+            )
+            assert runner._run_agent.await_count == 1
+            state = db.get_compression_failure_cooldown(session_id)
+            assert state is not None and state["remaining_seconds"] > 0
+            assert not any(
+                "Context compression timed out" in s["content"] for s in adapter.sent
+            ), "fence-cancel is not a summary-model timeout; no timeout toast"
+        finally:
+            release_worker.set()
+            if HungAfterFenceCancelAgent.last_instance is not None:
+                try:
+                    assert await asyncio.wait_for(asyncio.to_thread(worker_finished.wait, 2), timeout=2)
+                finally:
+                    assert await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 2), timeout=2)
     finally:
         db.close()
 
@@ -1783,12 +1807,22 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path, attach_gat
     ``except BaseException`` used to revoke the fence and re-raise with no
     cooldown, so the next turn after /restart re-triggered hygiene immediately.
     """
+    from hermes_cli import lifecycle
     from hermes_state import SessionDB
 
     worker_started = threading.Event()
     release_worker = threading.Event()
     cleanup_done = threading.Event()
     session_id = "sess-unwind"
+    inner_tasks = []
+    task = None
+
+    def track_async_reads(call):
+        async def tracked(*args, **kwargs):
+            inner = asyncio.create_task(call(*args, **kwargs))
+            inner_tasks.append(inner)
+            return await asyncio.shield(inner)
+        return tracked
 
     class SlowCompressAgent:
         last_instance = None
@@ -1818,11 +1852,31 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path, attach_gat
             monkeypatch, tmp_path, SlowCompressAgent, db, session_id,
             attach_gateway_executor=attach_gateway_executor,
         )
+        original_invoke_hook = lifecycle.invoke_hook
+        pre_dispatch_hook = MagicMock(return_value=[])
+
+        def isolated_invoke_hook(hook_name, *args, **kwargs):
+            if hook_name == "pre_gateway_dispatch":
+                return pre_dispatch_hook(hook_name, *args, **kwargs)
+            return original_invoke_hook(hook_name, *args, **kwargs)
+
+        monkeypatch.setattr(lifecycle, "invoke_hook", isolated_invoke_hook)
+        runner._session_has_compression_in_flight = track_async_reads(
+            runner._session_has_compression_in_flight,
+        )
+        runner._session_db.get_session = track_async_reads(runner._session_db.get_session)
         task = asyncio.create_task(runner._handle_message(event))
         assert await asyncio.to_thread(worker_started.wait, 2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        pre_dispatch_hook.assert_called_once_with(
+            "pre_gateway_dispatch", event=event, gateway=runner,
+            session_store=runner.session_store,
+        )
+        assert pre_dispatch_hook.call_args.kwargs["event"] is event
+        assert pre_dispatch_hook.call_args.kwargs["gateway"] is runner
+        assert pre_dispatch_hook.call_args.kwargs["session_store"] is runner.session_store
         state = db.get_compression_failure_cooldown(session_id)
         assert state is not None and state["remaining_seconds"] > 0, (
             "hygiene unwind did not persist a cooldown; got "
@@ -1831,4 +1885,14 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path, attach_gat
         release_worker.set()
         await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
     finally:
-        db.close()
+        try:
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            release_worker.set()
+            await asyncio.gather(*inner_tasks, return_exceptions=True)
+            if SlowCompressAgent.last_instance is not None:
+                await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+        finally:
+            db.close()

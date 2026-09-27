@@ -40,12 +40,24 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def _make_runner_with_cached_agent(close_fn, attach_gateway_executor):
+def _make_runner_with_cached_agent(close_fn, attach_gateway_executor, monkeypatch):
     """Build a bare GatewayRunner with a cached agent whose close() runs
     ``close_fn`` (used to simulate slow / blocking teardown)."""
     from gateway.run import GatewayRunner
+    from hermes_cli import lifecycle
 
     runner = attach_gateway_executor(object.__new__(GatewayRunner))
+    runner._persist_active_agents = MagicMock()
+    runner._finalize_session_off_loop = AsyncMock()
+    runner._session_reset_hook = MagicMock(return_value=[])
+    original_invoke_hook = lifecycle.invoke_hook
+
+    def invoke_hook(hook_name, **kwargs):
+        if hook_name == "on_session_reset":
+            return runner._session_reset_hook(**kwargs)
+        return original_invoke_hook(hook_name, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", invoke_hook)
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -90,21 +102,25 @@ def _make_runner_with_cached_agent(close_fn, attach_gateway_executor):
 
 
 @pytest.mark.asyncio
-async def test_reset_does_not_block_event_loop_during_cleanup(attach_gateway_executor):
+async def test_reset_does_not_block_event_loop_during_cleanup(attach_gateway_executor, monkeypatch):
     """#35994: a slow agent.close() must NOT block the event loop. A
     concurrent loop task must keep ticking WHILE close() is still blocking
     (proving cleanup was offloaded to a worker thread, not run inline on
     the loop). With the pre-fix inline call, the loop is frozen for the
     whole duration of close() and no ticks accumulate until it returns."""
     close_started = threading.Event()
+    close_finished = threading.Event()
     release = threading.Event()
 
     def slow_close():
         close_started.set()
         # Block the WORKER thread (not the loop) until released.
-        release.wait(timeout=5)
+        try:
+            release.wait(timeout=5)
+        finally:
+            close_finished.set()
 
-    runner = _make_runner_with_cached_agent(slow_close, attach_gateway_executor=attach_gateway_executor)
+    runner = _make_runner_with_cached_agent(slow_close, attach_gateway_executor=attach_gateway_executor, monkeypatch=monkeypatch)
 
     ticks = {"n": 0}
     stop = threading.Event()
@@ -119,24 +135,31 @@ async def test_reset_does_not_block_event_loop_during_cleanup(attach_gateway_exe
         runner._handle_reset_command(_make_event("/new"))
     )
 
-    # Wait until close() has actually started blocking in its worker thread.
-    for _ in range(200):
-        if close_started.is_set():
-            break
-        await asyncio.sleep(0.005)
-    assert close_started.is_set(), "close() never ran"
+    try:
+        # Wait until close() has actually started blocking in its worker thread.
+        for _ in range(200):
+            if close_started.is_set():
+                break
+            await asyncio.sleep(0.005)
+        assert close_started.is_set(), "close() never ran"
 
-    # Now sample ticks while close() is STILL blocking. If the loop were
-    # frozen (pre-fix inline call), this stays ~0.
-    ticks_at_block = ticks["n"]
-    await asyncio.sleep(0.1)
-    ticks_during_block = ticks["n"] - ticks_at_block
+        # Require real heartbeat turns while cleanup is still blocked.
+        ticks_at_block = ticks["n"]
+        while ticks["n"] - ticks_at_block < 5 and not close_finished.is_set():
+            await asyncio.sleep(0.005)
+        ticks_during_block = ticks["n"] - ticks_at_block
+        finished_before_release = close_finished.is_set()
 
-    release.set()
-    await reset_task
-    stop.set()
-    await hb
+        release.set()
+        await reset_task
+    finally:
+        release.set()
+        stop.set()
+        if not reset_task.done():
+            reset_task.cancel()
+        await asyncio.gather(reset_task, hb, return_exceptions=True)
 
+    assert not finished_before_release, "cleanup finished before release (#35994)"
     assert ticks_during_block >= 5, (
         f"event loop was blocked during agent cleanup (#35994): only "
         f"{ticks_during_block} ticks while close() was running"
@@ -145,7 +168,7 @@ async def test_reset_does_not_block_event_loop_during_cleanup(attach_gateway_exe
 
 
 @pytest.mark.asyncio
-async def test_reset_completes_when_cleanup_raises(caplog, attach_gateway_executor):
+async def test_reset_completes_when_cleanup_raises(caplog, attach_gateway_executor, monkeypatch):
     """#35994: if the offloaded cleanup itself raises, the handler swallows it
     (logs a warning) and still rotates the session — it must not abort /new.
 
@@ -154,7 +177,7 @@ async def test_reset_completes_when_cleanup_raises(caplog, attach_gateway_execut
     itself raise (patched on the instance), then assert the warning fired —
     proving the branch executed rather than the success path.
     """
-    runner = _make_runner_with_cached_agent(lambda: None, attach_gateway_executor=attach_gateway_executor)
+    runner = _make_runner_with_cached_agent(lambda: None, attach_gateway_executor=attach_gateway_executor, monkeypatch=monkeypatch)
 
     def boom_cleanup(_agent):
         raise RuntimeError("cleanup blew up")
@@ -172,10 +195,18 @@ async def test_reset_completes_when_cleanup_raises(caplog, attach_gateway_execut
     ), "expected the cleanup-failure warning to be logged (except branch not hit)"
     runner.session_store.reset_session.assert_called_once()
     assert result is not None
+    runner._finalize_session_off_loop.assert_awaited_once_with(
+        session_id="sess-old", platform="telegram", reason="new_session",
+        old_session_id="sess-old", new_session_id="sess-new",
+    )
+    runner._session_reset_hook.assert_called_once_with(
+        session_id="sess-new", reason="new_session", platform="telegram",
+        old_session_id="sess-old", new_session_id="sess-new",
+    )
 
 
 @pytest.mark.asyncio
-async def test_reset_completes_when_cleanup_times_out(caplog, attach_gateway_executor):
+async def test_reset_completes_when_cleanup_times_out(caplog, attach_gateway_executor, monkeypatch):
     """#35994: if cleanup exceeds the bounded timeout, the reset still completes
     (graceful degradation) and the timeout warning fires."""
     import gateway.slash_commands as _sc
@@ -187,7 +218,7 @@ async def test_reset_completes_when_cleanup_times_out(caplog, attach_gateway_exe
             aw.close()
         raise asyncio.TimeoutError
 
-    runner = _make_runner_with_cached_agent(lambda: None, attach_gateway_executor=attach_gateway_executor)
+    runner = _make_runner_with_cached_agent(lambda: None, attach_gateway_executor=attach_gateway_executor, monkeypatch=monkeypatch)
 
     with caplog.at_level(logging.WARNING, logger="gateway.run"):
         with patch.object(_sc.asyncio, "wait_for", _instant_timeout):
