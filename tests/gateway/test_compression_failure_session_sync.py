@@ -58,6 +58,7 @@ class _CompressionThenFailureAgent:
             "api_calls": 1,
         }
 
+
     def interrupt(self, *_args, **_kwargs):
         pass
 
@@ -89,8 +90,8 @@ class _Adapter:
         return None
 
 
-def _runner(session_store):
-    runner = object.__new__(gateway_run.GatewayRunner)
+def _runner(session_store, attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {Platform.TELEGRAM: _Adapter()}
     runner.config = SimpleNamespace(streaming=None, group_sessions_per_user=True, thread_sessions_per_user=False)
     runner.hooks = SimpleNamespace(loaded_hooks=False, emit=AsyncMock())
@@ -158,11 +159,11 @@ def _run_compression_failure_turn(runner, source, *, run_generation=None):
     )
 
 
-def test_failed_turn_still_syncs_compression_session_split(monkeypatch):
+def test_failed_turn_still_syncs_compression_session_split(monkeypatch, attach_gateway_executor):
     _install_compression_failure_agent(monkeypatch)
 
     session_store = _SessionStore()
-    runner = _runner(session_store)
+    runner = _runner(session_store, attach_gateway_executor=attach_gateway_executor)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="user-1")
 
     result = _run_compression_failure_turn(runner, source)
@@ -213,7 +214,7 @@ class _EmptyRateLimitFailureAgent(_CompressionThenFailureAgent):
         }
 
 
-def test_empty_rate_limit_response_preserves_failure_metadata(monkeypatch):
+def test_empty_rate_limit_response_preserves_failure_metadata(monkeypatch, attach_gateway_executor):
     """Sibling of the non-empty path (#64686): the empty-response return
     branch in _run_agent must also forward failure_reason, or downstream
     consumers lose the structured reason exactly when the run produced no
@@ -221,7 +222,7 @@ def test_empty_rate_limit_response_preserves_failure_metadata(monkeypatch):
     _install_compression_failure_agent(monkeypatch, _EmptyRateLimitFailureAgent)
 
     session_store = _SessionStore()
-    runner = _runner(session_store)
+    runner = _runner(session_store, attach_gateway_executor=attach_gateway_executor)
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="12345",
@@ -281,5 +282,3 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
-

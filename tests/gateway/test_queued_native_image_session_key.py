@@ -68,9 +68,9 @@ class CaptureQueuedNativeImageAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
-    runner = object.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -94,7 +94,7 @@ def _make_runner(adapter):
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_uses_pending_event_session_key_for_native_images(monkeypatch, tmp_path):
+async def test_queued_followup_uses_pending_event_session_key_for_native_images(monkeypatch, tmp_path, attach_gateway_executor):
     CaptureQueuedNativeImageAgent.calls = []
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -110,7 +110,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
 
     adapter = CaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
 
     image_path = tmp_path / "queued-image.png"
     image_path.write_bytes(_ONE_BY_ONE_PNG)

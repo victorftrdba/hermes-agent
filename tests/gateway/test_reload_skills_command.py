@@ -38,10 +38,10 @@ def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
 
 
-def _make_runner():
+def _make_runner(attach_gateway_executor):
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -89,7 +89,7 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
-async def test_reload_skills_handler_queues_note_on_diff(monkeypatch):
+async def test_reload_skills_handler_queues_note_on_diff(monkeypatch, attach_gateway_executor):
     """Diff non-empty → handler queues a one-shot note and does NOT touch transcript."""
     fake_result = {
         "added": [
@@ -107,7 +107,7 @@ async def test_reload_skills_handler_queues_note_on_diff(monkeypatch):
     import agent.skill_commands as skill_commands_mod
     monkeypatch.setattr(skill_commands_mod, "reload_skills", lambda: fake_result)
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     event = _make_event("/reload-skills")
     out = await runner._handle_reload_skills_command(event)
 
@@ -136,5 +136,4 @@ async def test_reload_skills_handler_queues_note_on_diff(monkeypatch):
     assert "    - beta: Run beta to do abc" in note
     assert "Removed Skills:" in note
     assert "    - gamma: Old removed skill" in note
-
 

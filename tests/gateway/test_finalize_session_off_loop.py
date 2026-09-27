@@ -22,12 +22,12 @@ import time
 from gateway.run import GatewayRunner
 
 
-def _make_runner():
-    runner = object.__new__(GatewayRunner)
+def _make_runner(attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     return runner
 
 
-def test_finalize_off_loop_invokes_lifecycle(monkeypatch):
+def test_finalize_off_loop_invokes_lifecycle(monkeypatch, attach_gateway_executor):
     """The helper reaches the real lifecycle entry point with the kwargs."""
     calls = []
 
@@ -39,7 +39,7 @@ def test_finalize_off_loop_invokes_lifecycle(monkeypatch):
 
     monkeypatch.setattr(lifecycle, "finalize_session", _fake_finalize)
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     asyncio.run(
         runner._finalize_session_off_loop(
             session_id="s-123",
@@ -55,7 +55,7 @@ def test_finalize_off_loop_invokes_lifecycle(monkeypatch):
     assert calls[0]["old_session_id"] == "s-123"
 
 
-def test_finalize_off_loop_keeps_loop_alive_and_bounds_wedged_hook(monkeypatch):
+def test_finalize_off_loop_keeps_loop_alive_and_bounds_wedged_hook(monkeypatch, attach_gateway_executor):
     """A hook that blocks past the budget cannot freeze the event loop.
 
     The loop must keep servicing other callbacks while the hook runs, and
@@ -72,7 +72,7 @@ def test_finalize_off_loop_keeps_loop_alive_and_bounds_wedged_hook(monkeypatch):
 
     monkeypatch.setattr(lifecycle, "finalize_session", _wedged_finalize)
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     monkeypatch.setattr(GatewayRunner, "_FINALIZE_TIMEOUT_S", 0.5, raising=False)
 
     loop_ticks = []
@@ -103,7 +103,7 @@ def test_finalize_off_loop_keeps_loop_alive_and_bounds_wedged_hook(monkeypatch):
     assert len(loop_ticks) >= 3
 
 
-def test_finalize_off_loop_swallows_hook_exceptions(monkeypatch):
+def test_finalize_off_loop_swallows_hook_exceptions(monkeypatch, attach_gateway_executor):
     """A raising hook is contained — callers proceed with shutdown."""
 
     def _raising_finalize(**kwargs):
@@ -113,7 +113,7 @@ def test_finalize_off_loop_swallows_hook_exceptions(monkeypatch):
 
     monkeypatch.setattr(lifecycle, "finalize_session", _raising_finalize)
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     # Must not raise.
     asyncio.run(
         runner._finalize_session_off_loop(
@@ -122,7 +122,7 @@ def test_finalize_off_loop_swallows_hook_exceptions(monkeypatch):
     )
 
 
-def test_shutdown_finalize_path_uses_off_loop_dispatch(monkeypatch):
+def test_shutdown_finalize_path_uses_off_loop_dispatch(monkeypatch, attach_gateway_executor):
     """_finalize_shutdown_agents routes finalize through the bounded helper."""
     seen = []
 
@@ -144,7 +144,7 @@ def test_shutdown_finalize_path_uses_off_loop_dispatch(monkeypatch):
         session_id = "s-shutdown"
         _session_messages = None
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     asyncio.run(runner._finalize_shutdown_agents({"k": _Agent()}))
 
     assert len(seen) == 1

@@ -48,8 +48,8 @@ def loop_env(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
-def _make_runner():
-    runner = object.__new__(GatewayRunner)
+def _make_runner(attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
@@ -75,8 +75,8 @@ def _make_event(text: str) -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_gateway_loop_create_captures_route(loop_env):
-    runner = _make_runner()
+async def test_gateway_loop_create_captures_route(loop_env, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     response = await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m check the deploy"))
     assert "Loop set" in response
     assert "every 5m" in response
@@ -90,8 +90,8 @@ async def test_gateway_loop_create_captures_route(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_gateway_loop_status_pause_stop(loop_env):
-    runner = _make_runner()
+async def test_gateway_loop_status_pause_stop(loop_env, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     status = await GatewayRunner._handle_loop_command(runner, _make_event("/loop status"))
@@ -105,18 +105,18 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_gateway_loop_goal_note_when_goal_active(loop_env):
+async def test_gateway_loop_goal_note_when_goal_active(loop_env, attach_gateway_executor):
     from hermes_cli.goals import GoalManager
 
     GoalManager(session_id="sid-gateway-loop").set("finish the migration")
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     response = await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     assert "active /goal" in response
 
 
 @pytest.mark.asyncio
-async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
-    runner = _make_runner()
+async def test_post_turn_loop_completion_completes_inflight_tick(loop_env, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -135,8 +135,8 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
-    runner = _make_runner()
+async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
     entry = _FakeSessionEntry()
     # No tick fired — the ordinary user turn must not consume loop state.
@@ -168,9 +168,9 @@ def test_streamed_already_sent_none_recovers_text_for_hooks():
 
 
 @pytest.mark.asyncio
-async def test_streamed_already_sent_completes_loop_tick(loop_env):
+async def test_streamed_already_sent_completes_loop_tick(loop_env, attach_gateway_executor):
     """A streamed wakeup must not leave awaiting_response stuck."""
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -197,8 +197,8 @@ async def test_streamed_already_sent_completes_loop_tick(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
-    runner = _make_runner()
+async def test_empty_agent_result_releases_inflight_loop_tick(loop_env, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -222,8 +222,8 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
 
 @pytest.mark.asyncio
-async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
-    runner = _make_runner()
+async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
     mgr = loops.LoopManager(session_id="sid-gateway-loop")
@@ -245,8 +245,8 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
 
 
 @pytest.mark.asyncio
-async def test_post_turn_session_resolution_failure_is_logged(loop_env, caplog):
-    runner = _make_runner()
+async def test_post_turn_session_resolution_failure_is_logged(loop_env, caplog, attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     runner.session_store.get_or_create_session = Mock(side_effect=RuntimeError("store unavailable"))
 
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
@@ -261,12 +261,12 @@ async def test_post_turn_session_resolution_failure_is_logged(loop_env, caplog):
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_keeps_event_loop_responsive_under_writer_lock(loop_env):
+async def test_loop_wakeup_watcher_keeps_event_loop_responsive_under_writer_lock(loop_env, attach_gateway_executor):
     """The wakeup scan's SessionDB calls (list_active_loops / fire_tick /
     complete_tick) must run off the loop thread. A slow writer holding the
     SessionDB writer lock used to block the whole gateway event loop for the
     duration of the hold (#92413)."""
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     runner._running = True
     runner._running_agents = {}
     runner.adapters = {}
@@ -327,11 +327,11 @@ async def test_loop_wakeup_watcher_keeps_event_loop_responsive_under_writer_lock
 
 
 @pytest.mark.asyncio
-async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loop_env):
+async def test_loop_wakeup_watcher_runs_every_sessiondb_call_off_loop_thread(loop_env, attach_gateway_executor):
     """Full wakeup path (slash-command loop, adapter present): list_active_loops,
     fire_tick and complete_tick must each execute on an executor thread, never
     on the event-loop thread (#92413)."""
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     runner._running = True
     runner._running_agents = {}
 

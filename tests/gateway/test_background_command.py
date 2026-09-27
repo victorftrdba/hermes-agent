@@ -26,10 +26,10 @@ def _make_event(text="/bg", platform=Platform.TELEGRAM,
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(attach_gateway_executor):
     """Create a bare GatewayRunner with minimal mocks."""
     from gateway.run import GatewayRunner
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.adapters = {}
     runner._voice_mode = {}
     runner._session_db = None
@@ -61,18 +61,18 @@ class TestHandleBackgroundCommand:
     """Tests for GatewayRunner._handle_background_command."""
 
     @pytest.mark.asyncio
-    async def test_no_prompt_shows_usage(self):
+    async def test_no_prompt_shows_usage(self, attach_gateway_executor):
         """Running /bg with no prompt shows usage."""
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event(text="/bg")
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
         assert "/bg" in result
 
     @pytest.mark.asyncio
-    async def test_empty_prompt_shows_usage(self):
+    async def test_empty_prompt_shows_usage(self, attach_gateway_executor):
         """Running /bg with only whitespace shows usage."""
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event(text="/bg   ")
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
@@ -88,9 +88,9 @@ class TestRunBackgroundTask:
 
 
     @pytest.mark.asyncio
-    async def test_no_credentials_sends_error(self):
+    async def test_no_credentials_sends_error(self, attach_gateway_executor):
         """When provider credentials are missing, an error is sent."""
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -111,9 +111,9 @@ class TestRunBackgroundTask:
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
 
     @pytest.mark.asyncio
-    async def test_successful_task_sends_result(self):
+    async def test_successful_task_sends_result(self, attach_gateway_executor):
         """When the agent completes successfully, the result is sent."""
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
@@ -172,9 +172,9 @@ class TestBackgroundInHelp:
     """Verify /bg and /btw appear in help text and known commands."""
 
     @pytest.mark.asyncio
-    async def test_bg_and_btw_in_help_output(self):
+    async def test_bg_and_btw_in_help_output(self, attach_gateway_executor):
         """The /help output includes /bg and /btw."""
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event(text="/help")
         result = await runner._handle_help_command(event)
         assert "/bg" in result
@@ -222,16 +222,16 @@ class TestHandleBtwCommand:
     """Tests for GatewayRunner._handle_btw_command (context-aware side question)."""
 
     @pytest.mark.asyncio
-    async def test_no_question_shows_usage(self):
-        runner = _make_runner()
+    async def test_no_question_shows_usage(self, attach_gateway_executor):
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event(text="/btw")
         result = await runner._handle_btw_command(event)
         assert "Usage:" in result
         assert "/btw" in result
 
     @pytest.mark.asyncio
-    async def test_no_history_reports_no_conversation(self):
-        runner = _make_runner()
+    async def test_no_history_reports_no_conversation(self, attach_gateway_executor):
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         store = AsyncMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s1")
         store.load_transcript.return_value = []
@@ -242,8 +242,8 @@ class TestHandleBtwCommand:
         assert "conversation" in result.lower()
 
     @pytest.mark.asyncio
-    async def test_dispatches_side_question_and_sends_answer(self):
-        runner = _make_runner()
+    async def test_dispatches_side_question_and_sends_answer(self, attach_gateway_executor):
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         store = AsyncMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s1")
         store.load_transcript.return_value = [
@@ -284,8 +284,8 @@ class TestHandleBtwCommand:
         assert "it was foo.py" in sent_text
 
     @pytest.mark.asyncio
-    async def test_no_credentials_reports_error(self):
-        runner = _make_runner()
+    async def test_no_credentials_reports_error(self, attach_gateway_executor):
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         store = AsyncMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s1")
         store.load_transcript.return_value = [{"role": "user", "content": "hi"}]

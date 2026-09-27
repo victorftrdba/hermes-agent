@@ -78,8 +78,8 @@ def _write_turnhold_config(tmp_path):
     )
 
 
-def _build_runner(gateway_run, adapter, fake_db):
-    runner = object.__new__(gateway_run.GatewayRunner)
+def _build_runner(gateway_run, adapter, fake_db, attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.config = GatewayConfig(
         platforms={
             Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")
@@ -161,7 +161,8 @@ async def _drain_deferred(runner, timeout=10.0):
 
 @pytest.mark.asyncio
 async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """A watermark-fenced worker keeps its commit admission at turn-hold
     expiry; its late summary is ADOPTED (committed), not discarded — while
@@ -230,7 +231,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     _install_fakes(monkeypatch, gateway_run, tmp_path, FencedStreamingAgent)
 
     adapter = _CaptureAdapter()
-    runner = _build_runner(gateway_run, adapter, fake_db)
+    runner = _build_runner(gateway_run, adapter, fake_db, attach_gateway_executor=attach_gateway_executor)
 
     started = time.monotonic()
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
@@ -280,7 +281,8 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
 
 @pytest.mark.asyncio
 async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commits(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """If the kept-admission worker ends WITHOUT committing (summary failed
     / attempt superseded), the flat non-escalating retry-after is restored so
@@ -326,7 +328,7 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
     _install_fakes(monkeypatch, gateway_run, tmp_path, FencedNoCommitAgent)
 
     adapter = _CaptureAdapter()
-    runner = _build_runner(gateway_run, adapter, fake_db)
+    runner = _build_runner(gateway_run, adapter, fake_db, attach_gateway_executor=attach_gateway_executor)
 
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
     assert result == "ok"
@@ -361,7 +363,8 @@ async def test_turn_hold_kept_admission_arms_flat_retry_only_when_nothing_commit
 
 @pytest.mark.asyncio
 async def test_turn_hold_without_watermark_fence_still_cancels(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """A worker whose commit is NOT watermark-fenced (no session_db /
     watermark capture failed) must still be cancelled at turn-hold expiry —
@@ -416,7 +419,7 @@ async def test_turn_hold_without_watermark_fence_still_cancels(
     _install_fakes(monkeypatch, gateway_run, tmp_path, UnfencedStreamingAgent)
 
     adapter = _CaptureAdapter()
-    runner = _build_runner(gateway_run, adapter, fake_db)
+    runner = _build_runner(gateway_run, adapter, fake_db, attach_gateway_executor=attach_gateway_executor)
 
     result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
     assert result == "ok"

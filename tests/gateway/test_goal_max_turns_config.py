@@ -25,9 +25,9 @@ class _FakeSessionStore:
         return "agent:main:discord:channel:goal-config"
 
 
-def _make_runner() -> GatewayRunner:
+def _make_runner(attach_gateway_executor) -> GatewayRunner:
     """GatewayRunner skeleton for the /goal command path (no adapters)."""
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
@@ -52,7 +52,7 @@ def _make_goal_event() -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monkeypatch):
+async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monkeypatch, attach_gateway_executor):
     """Gateway /goal should honor top-level goals.max_turns from config.yaml."""
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -64,7 +64,7 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
     # load the goal write can be dropped and the state assertion flakes.
     goals._get_session_db()
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
 
     event = _make_goal_event()
 
@@ -80,7 +80,7 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_goal_command_slow_db_init_still_persists(tmp_path, monkeypatch):
+async def test_goal_command_slow_db_init_still_persists(tmp_path, monkeypatch, attach_gateway_executor):
     """A slow state.db init (cold cache, first /goal of the process) must
     not silently drop the goal write: the gateway warms the cache off-loop,
     so the reply is honest at any init duration.
@@ -112,7 +112,7 @@ async def test_goal_command_slow_db_init_still_persists(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     goals._DB_CACHE.clear()
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     event = _make_goal_event()
 
     try:

@@ -1794,3 +1794,47 @@ def _moa_caches_isolated():
     yield
     moa._preset_cache.clear()
     moa._runtime_cache.clear()
+
+
+@pytest.fixture
+def attach_gateway_executor():
+    """Give bare gateway test runners an explicitly owned, drained executor."""
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+
+    shutdown_executor = GatewayRunner._shutdown_executor
+    owned = []
+
+    def attach(runner):
+        if getattr(runner, "_executor_closing", False):
+            raise RuntimeError("Cannot attach an executor to a shutting-down gateway")
+        if hasattr(runner, "_executor"):
+            executor = runner._executor
+            if executor is None or getattr(executor, "_shutdown", False):
+                raise RuntimeError("Cannot attach an executor to a closed gateway")
+            return runner
+
+        executor = ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="hermes-gateway"
+        )
+        runner._executor = executor
+        runner._executor_closing = False
+        owned.append((runner, executor))
+        return runner
+
+    yield attach
+
+    surviving_workers = []
+    for runner, executor in owned:
+        owner = (
+            runner
+            if getattr(runner, "_executor", None) is executor
+            else SimpleNamespace(_executor=executor)
+        )
+        shutdown_executor(owner, drain_timeout=2)
+        surviving_workers.extend(
+            worker.name for worker in executor._threads if worker.is_alive()
+        )
+    assert not surviving_workers, surviving_workers

@@ -145,8 +145,8 @@ class _FakeAdapter:
         self._pending_messages = {}
 
 
-def _make_runner() -> tuple[GatewayRunner, _FakeAdapter]:
-    runner = object.__new__(GatewayRunner)
+def _make_runner(attach_gateway_executor) -> tuple[GatewayRunner, _FakeAdapter]:
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
@@ -174,9 +174,10 @@ def _resume_event() -> MessageEvent:
 class TestGatewayResumeRestartsWork:
     @pytest.mark.asyncio
     async def test_resume_after_budget_exhaustion_enqueues_continuation(
-        self, hermes_home
+        self, hermes_home,
+        attach_gateway_executor,
     ):
-        runner, adapter = _make_runner()
+        runner, adapter = _make_runner(attach_gateway_executor=attach_gateway_executor)
         _exhaust_budget(_GW_SID)
 
         response = await GatewayRunner._handle_goal_command(runner, _resume_event())
@@ -197,8 +198,8 @@ class TestGatewayResumeRestartsWork:
         assert state.turns_used == 0
 
     @pytest.mark.asyncio
-    async def test_resume_without_goal_enqueues_nothing(self, hermes_home):
-        runner, adapter = _make_runner()
+    async def test_resume_without_goal_enqueues_nothing(self, hermes_home, attach_gateway_executor):
+        runner, adapter = _make_runner(attach_gateway_executor=attach_gateway_executor)
 
         response = await GatewayRunner._handle_goal_command(runner, _resume_event())
 

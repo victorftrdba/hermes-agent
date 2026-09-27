@@ -44,8 +44,8 @@ def _install_fake_agent(monkeypatch):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
 
-def _make_runner():
-    runner = object.__new__(gateway_run.GatewayRunner)
+def _make_runner(attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {}
     runner.session_store = None
     runner.config = None
@@ -108,8 +108,8 @@ def test_resolve_runtime_agent_kwargs_preserves_request_overrides(monkeypatch):
     }
 
 
-def test_turn_route_preserves_provider_request_overrides_without_fast_mode():
-    runner = _make_runner()
+def test_turn_route_preserves_provider_request_overrides_without_fast_mode(attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     runner._service_tier = None
     runtime_kwargs = {
         "api_key": "***",
@@ -136,8 +136,8 @@ def test_turn_route_preserves_provider_request_overrides_without_fast_mode():
     }
 
 
-def test_turn_route_merges_fast_mode_with_provider_request_overrides():
-    runner = _make_runner()
+def test_turn_route_merges_fast_mode_with_provider_request_overrides(attach_gateway_executor):
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     runner._service_tier = "priority"
     runtime_kwargs = {
         "api_key": "***",
@@ -170,7 +170,7 @@ def test_turn_route_merges_fast_mode_with_provider_request_overrides():
 
 
 @pytest.mark.asyncio
-async def test_run_agent_preserves_provider_request_overrides_on_gateway_path(monkeypatch):
+async def test_run_agent_preserves_provider_request_overrides_on_gateway_path(monkeypatch, attach_gateway_executor):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
@@ -193,7 +193,7 @@ async def test_run_agent_preserves_provider_request_overrides_on_gateway_path(mo
 
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     source = _make_source()
     session_key = "agent:main:feishu:dm:ou_test"
 
@@ -219,7 +219,7 @@ async def test_run_agent_preserves_provider_request_overrides_on_gateway_path(mo
     }
 
 @pytest.mark.asyncio
-async def test_reused_agent_turn_merges_request_overrides_not_overwrite(monkeypatch):
+async def test_reused_agent_turn_merges_request_overrides_not_overwrite(monkeypatch, attach_gateway_executor):
     """Merge-not-overwrite regression (salvaged from PR #52432).
 
     A cached/reused gateway agent must keep its init-time request_overrides
@@ -249,7 +249,7 @@ async def test_reused_agent_turn_merges_request_overrides_not_overwrite(monkeypa
 
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
     source = _make_source()
     session_key = "agent:main:feishu:dm:ou_test"
 

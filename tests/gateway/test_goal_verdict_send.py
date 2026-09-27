@@ -70,11 +70,11 @@ class _RecordingAdapter:
         return _R()
 
 
-def _make_runner_with_adapter(session_id: str = None):
+def _make_runner_with_adapter(session_id: str = None, *, attach_gateway_executor):
     from gateway.run import GatewayRunner
     import uuid
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
     )
@@ -118,12 +118,12 @@ async def _drain_until(condition, timeout=5.0):
 
 
 @pytest.mark.asyncio
-async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
+async def test_goal_verdict_continue_enqueues_continuation(hermes_home, attach_gateway_executor):
     """When the judge says continue, both the 'continuing' status and the
     continuation-prompt event must be delivered. The continuation prompt is
     routed through the adapter's pending-messages FIFO so the goal loop
     proceeds on the next turn."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    runner, adapter, session_entry, src = _make_runner_with_adapter(attach_gateway_executor=attach_gateway_executor)
 
     from hermes_cli.goals import GoalManager
 
@@ -146,10 +146,10 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
 
 @pytest.mark.asyncio
-async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
+async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home, attach_gateway_executor):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    runner, adapter, session_entry, src = _make_runner_with_adapter(attach_gateway_executor=attach_gateway_executor)
 
     from hermes_cli.goals import GoalManager, save_goal
 
@@ -172,5 +172,4 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert "turns used" in content.lower()
     # No continuation enqueued when budget is exhausted
     assert not adapter._pending_messages
-
 

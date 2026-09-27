@@ -147,7 +147,7 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
 
 
 @pytest.mark.asyncio
-async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_home):
+async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_home, attach_gateway_executor):
     """_post_turn_goal_continuation resolves the FIFO key via
     _session_key_for_source; the adapter drain uses build_session_key on the
     event source. These must agree or the continuation is orphaned under a
@@ -163,7 +163,7 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     src = _slack_thread_source()
     adapter_key = build_session_key(src)
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     from gateway.config import GatewayConfig
 
     runner.config = GatewayConfig(

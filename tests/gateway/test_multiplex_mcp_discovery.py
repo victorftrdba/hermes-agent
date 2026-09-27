@@ -46,7 +46,8 @@ async def test_gateway_boot_discovers_mcp_under_every_profile_home(
 
 @pytest.mark.asyncio
 async def test_reload_mcp_only_touches_requesting_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    attach_gateway_executor,
 ) -> None:
     from gateway.run import GatewayRunner
     from tools import mcp_tool
@@ -57,7 +58,7 @@ async def test_reload_mcp_only_touches_requesting_profile(
     worker_home.mkdir(parents=True)
     worker_scope = hermes_home_key(worker_home)
 
-    runner = GatewayRunner.__new__(GatewayRunner)
+    runner = attach_gateway_executor(GatewayRunner.__new__(GatewayRunner))
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._resolve_profile_home_for_source = MagicMock(return_value=worker_home)
     runner._agent_cache = {}
@@ -104,7 +105,8 @@ async def test_reload_mcp_only_touches_requesting_profile(
 
 @pytest.mark.asyncio
 async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    attach_gateway_executor,
 ) -> None:
     """A shared connection remains visible when its peer profile reloads MCP."""
     from gateway.run import GatewayRunner
@@ -117,7 +119,7 @@ async def test_reload_mcp_reports_a_shared_server_to_a_non_owner_profile(
     worker_scope = hermes_home_key(worker_home)
     launch_scope = hermes_home_key(tmp_path / "default")
 
-    runner = GatewayRunner.__new__(GatewayRunner)
+    runner = attach_gateway_executor(GatewayRunner.__new__(GatewayRunner))
     runner.config = GatewayConfig(multiplex_profiles=True)
     runner._resolve_profile_home_for_source = MagicMock(return_value=worker_home)
     runner._agent_cache = {}

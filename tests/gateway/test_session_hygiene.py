@@ -232,7 +232,7 @@ class TestTokenEstimation:
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
+async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path, attach_gateway_executor):
     """Regression for #21301: the hygiene agent is built without a session_db,
     so _compress_context cannot rotate. When it neither rotates NOR compacts
     in place, the transcript MUST be preserved — an unconditional
@@ -267,7 +267,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -355,7 +355,8 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
 @pytest.mark.asyncio
 async def test_session_hygiene_no_rotation_does_not_clear_a_failure_streak(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """The degenerate no-rotate path must not count as recovery (#79624).
 
@@ -383,7 +384,7 @@ async def test_session_hygiene_no_rotation_does_not_clear_a_failure_streak(
         approx_tokens=50_000, new_tokens=30_000,
     ) is False
 
-    runner = object.__new__(_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(_run.GatewayRunner))
     state = runner._session_state("telegram:-1001:17585")
     state.persistent.hygiene_failure_streak = 2
     # A non-recovering run must leave it alone.
@@ -395,7 +396,7 @@ async def test_session_hygiene_no_rotation_does_not_clear_a_failure_streak(
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_preserves_transcript_when_in_place_configured_but_no_db(monkeypatch, tmp_path):
+async def test_session_hygiene_preserves_transcript_when_in_place_configured_but_no_db(monkeypatch, tmp_path, attach_gateway_executor):
     """Regression: when compression.in_place is True but the hygiene agent has
     no session_db, archive_and_compact cannot run — _last_compaction_in_place
     stays False.  The guard must read the *result* flag, not the *config* flag,
@@ -429,7 +430,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -494,7 +495,7 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
+async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path, attach_gateway_executor):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
     The worker remains alive long enough to cross the old race window. The
@@ -566,7 +567,7 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -652,7 +653,8 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 @pytest.mark.asyncio
 async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """A compression that still streams progress must not hold the turn hostage.
 
@@ -733,7 +735,7 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -848,7 +850,8 @@ async def test_session_hygiene_turn_hold_budget_abandons_streaming_wait(
 
 @pytest.mark.asyncio
 async def test_session_hygiene_idle_timeout_still_takes_failure_path(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """A genuine no-progress idle timeout must still take the existing
     failure path: AGENT_COMPRESSION_TIMEOUT provenance, "no output" user
@@ -910,7 +913,7 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -996,7 +999,8 @@ async def test_session_hygiene_idle_timeout_still_takes_failure_path(
 
 @pytest.mark.asyncio
 async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Regression for #60947: gateway hygiene should not rely on
     helper-agent session rotation to shrink a live gateway transcript.
@@ -1065,7 +1069,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1155,7 +1159,8 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
 @pytest.mark.asyncio
 async def test_session_hygiene_honors_configurable_hard_message_limit(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """compression.hygiene_hard_message_limit overrides the default.
 
@@ -1199,7 +1204,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1275,7 +1280,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 # Progress-aware hygiene wait: slow-but-streaming models are not punished
 # ---------------------------------------------------------------------------
 
-def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
+def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text, attach_gateway_executor):
     """Shared scaffolding for the progress-aware hygiene wait tests."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -1292,7 +1297,7 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1354,7 +1359,7 @@ def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 
-def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id):
+def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id, attach_gateway_executor):
     """Scaffolding for the restart-persistence tests: a fresh GatewayRunner
     wired to a REAL AsyncSessionDB facade (not a MagicMock) so the hygiene
     cooldown check/write paths exercise the actual SQLite-backed methods."""
@@ -1380,7 +1385,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
     GatewayRunner = gateway_run.GatewayRunner
 
     adapter = HygieneCaptureAdapter()
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
     )
@@ -1441,7 +1446,8 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 @pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Regression for #74136: the compression-failure cooldown must be
     persisted to the state DB, not an in-memory dict on the runner.
@@ -1496,7 +1502,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
                 return (messages, None)
 
         runner1, _adapter1, event1 = _make_cooldown_runner(
-            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
+            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         assert await runner1._handle_message(event1) == "ok"
         assert AbortingCompressAgent.instances == 1
@@ -1530,7 +1537,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
                 return (messages, None)
 
         runner2, _adapter2, event2 = _make_cooldown_runner(
-            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         assert await runner2._handle_message(event2) == "ok"
         assert ShouldNotRunAgent.instances == 0, (
@@ -1546,7 +1554,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         # restart must use rung 2 (900s), not start over at 300s (#86650).
         db.clear_compression_failure_cooldown(session_id)
         runner3, _adapter3, event3 = _make_cooldown_runner(
-            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id
+            monkeypatch, tmp_path, AbortingCompressAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         assert await runner3._handle_message(event3) == "ok"
         assert AbortingCompressAgent.instances == 2
@@ -1565,7 +1574,8 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
 @pytest.mark.asyncio
 async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """A fence-cancelled hygiene worker returns the original transcript with
     ``_last_compress_aborted`` still False (failure_class=commit_fence_cancelled).
@@ -1604,7 +1614,8 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
     try:
         db.create_session(session_id, "telegram")
         runner1, adapter1, event1 = _make_cooldown_runner(
-            monkeypatch, tmp_path, FenceCancelCompressAgent, db, session_id
+            monkeypatch, tmp_path, FenceCancelCompressAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         assert await runner1._handle_message(event1) == "ok"
         assert FenceCancelCompressAgent.instances == 1
@@ -1634,7 +1645,8 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
                 return (messages, None)
 
         runner2, _adapter2, event2 = _make_cooldown_runner(
-            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         assert await runner2._handle_message(event2) == "ok"
         assert ShouldNotRunAgent.instances == 0, (
@@ -1648,7 +1660,8 @@ async def test_hygiene_fence_cancel_records_cooldown_without_abort_flag(
 
 @pytest.mark.asyncio
 async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Once the commit fence is cancelled, the host must stop extending the
     wait — even if the shielded worker is still alive and touching progress.
@@ -1697,7 +1710,8 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     try:
         db.create_session(session_id, "telegram")
         runner, adapter, event = _make_cooldown_runner(
-            monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id
+            monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         started = time.monotonic()
         result = await runner._handle_message(event)
@@ -1723,7 +1737,8 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
 
 @pytest.mark.asyncio
 async def test_hygiene_skips_when_compression_already_in_flight(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Do not spawn a sibling hygiene compressor while a lock is already held."""
     from hermes_state import SessionDB
@@ -1750,7 +1765,8 @@ async def test_hygiene_skips_when_compression_already_in_flight(
     try:
         db.create_session(session_id, "telegram")
         runner, _adapter, event = _make_cooldown_runner(
-            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         runner._session_has_compression_in_flight = AsyncMock(return_value=True)
         assert await runner._handle_message(event) == "ok"
@@ -1761,7 +1777,7 @@ async def test_hygiene_skips_when_compression_already_in_flight(
 
 
 @pytest.mark.asyncio
-async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
+async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path, attach_gateway_executor):
     """Restart-drain cancellation must persist a cooldown before re-raising.
 
     ``except BaseException`` used to revoke the fence and re-raise with no
@@ -1799,7 +1815,8 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
     try:
         db.create_session(session_id, "telegram")
         runner, _adapter, event = _make_cooldown_runner(
-            monkeypatch, tmp_path, SlowCompressAgent, db, session_id
+            monkeypatch, tmp_path, SlowCompressAgent, db, session_id,
+            attach_gateway_executor=attach_gateway_executor,
         )
         task = asyncio.create_task(runner._handle_message(event))
         assert await asyncio.to_thread(worker_started.wait, 2)

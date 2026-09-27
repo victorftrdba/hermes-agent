@@ -20,10 +20,10 @@ def _make_event(text="/debug", platform=Platform.TELEGRAM,
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(attach_gateway_executor):
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig()
     runner.adapters = {}
     return runner
@@ -31,8 +31,8 @@ def _make_runner():
 
 class TestHandleDebugCommand:
     @pytest.mark.asyncio
-    async def test_debug_sweeps_expired_pastes_before_upload(self):
-        runner = _make_runner()
+    async def test_debug_sweeps_expired_pastes_before_upload(self, attach_gateway_executor):
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event()
 
         with patch("hermes_cli.debug._sweep_expired_pastes", return_value=(0, 0)) as mock_sweep, \
@@ -44,4 +44,3 @@ class TestHandleDebugCommand:
 
         mock_sweep.assert_called_once()
         assert "https://paste.rs/report" in result
-

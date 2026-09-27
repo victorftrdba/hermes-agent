@@ -18,10 +18,10 @@ def _source(user_id: str = "user-1", *, chat_type: str = "dm") -> SessionSource:
     )
 
 
-def _runner(*, admins=(), group_admins=()):
+def _runner(*, admins=(), group_admins=(), attach_gateway_executor):
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={
             Platform.DISCORD: PlatformConfig(
@@ -62,11 +62,11 @@ def _event(user_id: str = "user-1", *, chat_type: str = "dm"):
         (("admin-1",), "user-1"),
     ],
 )
-async def test_gateway_gate_add_requires_explicit_admin(admins, user_id):
+async def test_gateway_gate_add_requires_explicit_admin(admins, user_id, attach_gateway_executor):
     """Allowed chat users must not turn /goal into an unrestricted host shell."""
     from gateway.run import GatewayRunner
 
-    runner, manager = _runner(admins=admins)
+    runner, manager = _runner(admins=admins, attach_gateway_executor=attach_gateway_executor)
 
     result = await GatewayRunner._handle_goal_command(runner, _event(user_id))
 
@@ -75,11 +75,11 @@ async def test_gateway_gate_add_requires_explicit_admin(admins, user_id):
 
 
 @pytest.mark.asyncio
-async def test_gateway_explicit_admin_can_add_goal_gate():
+async def test_gateway_explicit_admin_can_add_goal_gate(attach_gateway_executor):
     """The fix preserves the documented quality-gate capability for operators."""
     from gateway.run import GatewayRunner
 
-    runner, manager = _runner(admins=("admin-1",))
+    runner, manager = _runner(admins=("admin-1",), attach_gateway_executor=attach_gateway_executor)
 
     result = await GatewayRunner._handle_goal_command(runner, _event("admin-1"))
 
@@ -90,13 +90,14 @@ async def test_gateway_explicit_admin_can_add_goal_gate():
 
 
 @pytest.mark.asyncio
-async def test_gateway_group_gate_add_uses_group_admin_scope():
+async def test_gateway_group_gate_add_uses_group_admin_scope(attach_gateway_executor):
     """DM admin status must not silently grant host-shell access in groups."""
     from gateway.run import GatewayRunner
 
     runner, manager = _runner(
         admins=("dm-admin",),
         group_admins=("group-admin",),
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     denied = await GatewayRunner._handle_goal_command(
@@ -116,11 +117,11 @@ async def test_gateway_group_gate_add_uses_group_admin_scope():
 
 
 @pytest.mark.asyncio
-async def test_gateway_non_admin_can_still_list_goal_gates():
+async def test_gateway_non_admin_can_still_list_goal_gates(attach_gateway_executor):
     """Non-admins retain read-only visibility into the active goal's gates."""
     from gateway.run import GatewayRunner
 
-    runner, manager = _runner(admins=("admin-1",))
+    runner, manager = _runner(admins=("admin-1",), attach_gateway_executor=attach_gateway_executor)
     manager.render_gates.return_value = "- 1. $ scripts/run_tests.sh"
     event = _event("user-1")
     event.get_command_args.return_value = "gate list"

@@ -206,10 +206,11 @@ class _DiscordMediaFailureAdapter(BasePlatformAdapter):
 @pytest.mark.asyncio
 async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_image(
     tmp_path, monkeypatch,
+    attach_gateway_executor,
 ):
     event = _event(thread_id="topic-1")
     media_file = _allowed_media_path(tmp_path, monkeypatch, "pricelist.png")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
     runner._reply_anchor_for_event = lambda event: event.message_id
 
@@ -249,11 +250,12 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
 @pytest.mark.asyncio
 async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
     tmp_path, monkeypatch,
+    attach_gateway_executor,
 ):
     """Queued text and media must stay on the same precomputed reply route."""
     event = _event(thread_id="source-topic")
     media_file = _allowed_media_path(tmp_path, monkeypatch, "threaded.png")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = (
         lambda source, reply_to_message_id=None: {"thread_id": "recomputed-topic"}
     )
@@ -297,9 +299,9 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
+async def test_queued_followup_delivery_keeps_remote_image_url_in_text(attach_gateway_executor):
     event = _event(thread_id="topic-1")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
     runner._reply_anchor_for_event = lambda event: event.message_id
 
@@ -336,11 +338,12 @@ async def test_queued_followup_delivery_keeps_remote_image_url_in_text():
 @pytest.mark.asyncio
 async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
     tmp_path, monkeypatch,
+    attach_gateway_executor,
 ):
     """Queued delivery must not strip paths its explicit-only uploader ignores."""
     event = _event(thread_id="topic-1")
     media_file = _allowed_media_path(tmp_path, monkeypatch, "inspected.png")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = (
         lambda source, reply_to_message_id=None: {"thread_id": "topic-1"}
     )
@@ -378,10 +381,10 @@ async def test_queued_followup_delivery_keeps_bare_local_path_in_text(
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_delivery_preserves_protected_media_example():
+async def test_queued_followup_delivery_preserves_protected_media_example(attach_gateway_executor):
     """Inline-code MEDIA examples must remain visible after queued text cleanup."""
     event = _event(thread_id="topic-1")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
     runner._reply_anchor_for_event = lambda event: event.message_id
 
@@ -417,12 +420,12 @@ async def test_queued_followup_delivery_preserves_protected_media_example():
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_delivery_skips_media_when_turn_failed():
+async def test_queued_followup_delivery_skips_media_when_turn_failed(attach_gateway_executor):
     """A failed first turn delivers its (failure) text but never uploads
     attachments as if the turn succeeded — deliver_media=False mirrors the
     completed-turn path's ``not agent_result.get("failed")`` guard."""
     event = _event(thread_id="topic-1")
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._thread_metadata_for_source = lambda source, anchor=None: {"thread_id": "topic-1"}
     runner._reply_anchor_for_event = lambda event: event.message_id
 
@@ -512,6 +515,7 @@ class _QueuedMediaAgent:
 @pytest.mark.asyncio
 async def test_queued_resend_branch_delivers_media_and_preserves_protected_example(
     tmp_path, monkeypatch,
+    attach_gateway_executor,
 ):
     """Exercise the real queued first-response resend path in ``_run_agent``."""
     media_file = _allowed_media_path(tmp_path, monkeypatch, "quote.png")
@@ -529,7 +533,7 @@ async def test_queued_resend_branch_delivers_media_and_preserves_protected_examp
 
     adapter = _QueuedMediaCaptureAdapter()
     gateway_run = importlib.import_module("gateway.run")
-    runner = object.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []

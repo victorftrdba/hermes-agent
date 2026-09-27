@@ -76,10 +76,10 @@ class ClarifyThenToolAgent:
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -118,7 +118,7 @@ def _install_fakes(monkeypatch, mode):
 
 @pytest.mark.parametrize("mode", ["verbose", "all"])
 @pytest.mark.asyncio
-async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path, mode):
+async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path, mode, attach_gateway_executor):
     """No progress bubble for clarify — in any mode, especially verbose.
 
     Verbose mode used to dump the raw args JSON
@@ -126,7 +126,7 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     interactive prompt (#52374).
     """
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = _install_fakes(monkeypatch, mode)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 

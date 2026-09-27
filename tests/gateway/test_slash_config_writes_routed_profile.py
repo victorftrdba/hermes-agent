@@ -53,10 +53,12 @@ def homes(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slash_config_writes_hit_routed_profile_and_leave_default_untouched(homes):
+async def test_slash_config_writes_hit_routed_profile_and_leave_default_untouched(
+    homes, attach_gateway_executor
+):
     default_home, routed_home = homes
     default_before = (default_home / "config.yaml").read_bytes()
-    runner = _Runner()
+    runner = attach_gateway_executor(_Runner())
 
     with _profile_runtime_scope(routed_home):
         assert runner._save_gateway_config_key("agent.reasoning_effort", "high")

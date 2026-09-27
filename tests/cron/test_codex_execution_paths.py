@@ -122,7 +122,7 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
 
 
-def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch, attach_gateway_executor):
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
@@ -142,7 +142,7 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     _Codex401ThenSuccessAgent.refresh_attempts = 0
     _Codex401ThenSuccessAgent.last_init = {}
 
-    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner))
     runner.adapters = {}
     runner._ephemeral_system_prompt = ""
     runner._prefill_messages = []

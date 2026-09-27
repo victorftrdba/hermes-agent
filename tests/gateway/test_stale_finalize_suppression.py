@@ -132,9 +132,9 @@ class CompleteStreamAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
-    runner = object.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -158,7 +158,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id, attach_gateway_executor):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -184,7 +184,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = FinalizeCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -214,12 +214,14 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
 
 @pytest.mark.asyncio
 async def test_stale_finalize_does_not_suppress_complete_response(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """The complete response must reach the platform even when the finalize
     edit succeeded with only the stale preview snapshot."""
     adapter, result = await _run_streaming_turn(
-        monkeypatch, tmp_path, StalePrefixAgent, "sess-71643-stale-finalize"
+        monkeypatch, tmp_path, StalePrefixAgent, "sess-71643-stale-finalize",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == FULL_RESPONSE
@@ -251,12 +253,14 @@ async def test_stale_finalize_does_not_suppress_complete_response(
 
 @pytest.mark.asyncio
 async def test_equal_text_control_still_suppresses_duplicate_send(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """When the streamed text equals the final response, suppression must
     keep working — no duplicate full-response send."""
     adapter, result = await _run_streaming_turn(
-        monkeypatch, tmp_path, CompleteStreamAgent, "sess-71643-control-equal"
+        monkeypatch, tmp_path, CompleteStreamAgent, "sess-71643-control-equal",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == FULL_RESPONSE
@@ -286,7 +290,8 @@ class _PayloadLessSplitConsumer(GatewayStreamConsumer):
 
 @pytest.mark.asyncio
 async def test_payload_less_split_does_not_suppress_complete_response(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """#78541 — payload-less split-delivery flags must not swallow the reply."""
     import yaml
@@ -326,7 +331,7 @@ async def test_payload_less_split_does_not_suppress_complete_response(
     )
 
     adapter = FinalizeCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1004492624436",

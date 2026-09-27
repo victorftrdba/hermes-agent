@@ -290,7 +290,7 @@ class TestAgentCloseMethod:
 class TestGatewayCleanupWiring:
     """Verify gateway lifecycle calls close() on agents."""
 
-    def test_gateway_stop_calls_close(self):
+    def test_gateway_stop_calls_close(self, attach_gateway_executor):
         """gateway stop() should call close() on all running agents."""
         import asyncio
         import threading
@@ -298,7 +298,7 @@ class TestGatewayCleanupWiring:
 
         from gateway.run import GatewayRunner
 
-        runner = object.__new__(GatewayRunner)
+        runner = attach_gateway_executor(object.__new__(GatewayRunner))
         runner._running = True
         runner._running_agents = {}
         runner._running_agents_ts = {}
@@ -346,7 +346,7 @@ class TestGatewayCleanupWiring:
         mock_agent_1.close.assert_called()
         mock_agent_2.close.assert_called()
 
-    def test_evict_does_not_call_close(self):
+    def test_evict_does_not_call_close(self, attach_gateway_executor):
         """_evict_cached_agent() should NOT call close() — it's also used
         for non-destructive refreshes (model switch, branch, fallback)."""
         import threading
@@ -354,7 +354,7 @@ class TestGatewayCleanupWiring:
 
         from gateway.run import GatewayRunner
 
-        runner = object.__new__(GatewayRunner)
+        runner = attach_gateway_executor(object.__new__(GatewayRunner))
         runner._agent_cache_lock = threading.Lock()
 
         mock_agent = MagicMock()
