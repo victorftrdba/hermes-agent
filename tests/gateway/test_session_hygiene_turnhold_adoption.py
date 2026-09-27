@@ -233,50 +233,84 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     adapter = _CaptureAdapter()
     runner = _build_runner(gateway_run, adapter, fake_db, attach_gateway_executor=attach_gateway_executor)
 
-    started = time.monotonic()
-    result = await asyncio.wait_for(runner._handle_message(_make_event()), timeout=15)
-    elapsed = time.monotonic() - started
+    from hermes_cli import lifecycle
 
-    # #90845/#92318 invariant intact: the turn is released at the budget.
-    assert result == "ok"
-    assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
-    assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
+    original_invoke_hook = lifecycle.invoke_hook
+    pre_dispatch_hook = MagicMock(return_value=[])
 
-    # (b) NO retry-after was armed while the attempt is still running —
-    # arming it would block the agent-side preflight from adopting the
-    # finished summary ("same-session cooldown active", #97963).
-    assert not fake_db.record_compression_failure_cooldown.called, (
-        "keep-admission path must not arm the retry-after while the "
-        "detached attempt is still running"
-    )
+    def isolated_invoke_hook(hook_name, *args, **kwargs):
+        if hook_name == "pre_gateway_dispatch":
+            return pre_dispatch_hook(hook_name, *args, **kwargs)
+        return original_invoke_hook(hook_name, *args, **kwargs)
 
-    # The detached worker finishes late; its commit is ADMITTED (adoption),
-    # not refused — the summary attempt is no longer burned.
-    release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(committed.wait, 5), timeout=6)
-    assert committed.is_set(), (
-        "watermark-fenced worker must keep its commit admission after "
-        "turn-hold expiry (fence was cancelled — attempt burned)"
-    )
-    fake_db.archive_and_compact.assert_called_once()
-    # The commit went through the watermark-fenced path (concurrent tail
-    # rows above the watermark survive the compaction).
-    assert fake_db.archive_and_compact.call_args.kwargs.get("watermark") == 6
+    monkeypatch.setattr(lifecycle, "invoke_hook", isolated_invoke_hook)
+    try:
+        started = time.monotonic()
+        event = _make_event()
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+        elapsed = time.monotonic() - started
 
-    await _drain_deferred(runner)
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
-    FencedStreamingAgent.last_instance.close.assert_called_once()
+        # #90845/#92318 invariant intact: the turn is released at the budget.
+        assert result == "ok"
+        assert elapsed < 5.0, f"turn held for {elapsed:.1f}s despite the turn-hold budget"
+        assert worker_started.is_set()
+        assert runner._run_agent.await_count == 1
+        pre_dispatch_hook.assert_called_once_with(
+            "pre_gateway_dispatch", event=event, gateway=runner,
+            session_store=runner.session_store,
+        )
+        assert pre_dispatch_hook.call_args.kwargs["event"] is event
+        assert pre_dispatch_hook.call_args.kwargs["gateway"] is runner
+        assert pre_dispatch_hook.call_args.kwargs["session_store"] is runner.session_store
 
-    # Successful adoption resets the hygiene failure streak and still never
-    # advances it (the deferral is not a failure).
-    assert not fake_db.increment_hygiene_failure_streak.called
-    assert fake_db.reset_hygiene_failure_streak.called
-    # Deferral notice still reaches the user.
-    sent = [m["content"] for m in adapter.sent]
-    assert any(
-        "deferred" in c.lower() or "still streaming" in c.lower() for c in sent
-    ), f"turn-hold must send deferral notice, got: {sent}"
+        # (b) NO retry-after was armed while the attempt is still running —
+        # arming it would block the agent-side preflight from adopting the
+        # finished summary ("same-session cooldown active", #97963).
+        assert not fake_db.record_compression_failure_cooldown.called, (
+            "keep-admission path must not arm the retry-after while the "
+            "detached attempt is still running"
+        )
+
+        # The detached worker finishes late; its commit is ADMITTED (adoption),
+        # not refused — the summary attempt is no longer burned.
+        release_worker.set()
+        await asyncio.wait_for(asyncio.to_thread(committed.wait, 5), timeout=6)
+        assert committed.is_set(), (
+            "watermark-fenced worker must keep its commit admission after "
+            "turn-hold expiry (fence was cancelled — attempt burned)"
+        )
+        fake_db.archive_and_compact.assert_called_once()
+        # The commit went through the watermark-fenced path (concurrent tail
+        # rows above the watermark survive the compaction).
+        assert fake_db.archive_and_compact.call_args.kwargs.get("watermark") == 6
+
+        await _drain_deferred(runner)
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
+        FencedStreamingAgent.last_instance.close.assert_called_once()
+
+        # Successful adoption resets the hygiene failure streak and still never
+        # advances it (the deferral is not a failure).
+        assert not fake_db.increment_hygiene_failure_streak.called
+        assert fake_db.reset_hygiene_failure_streak.called
+        # Deferral notice still reaches the user.
+        sent = [m["content"] for m in adapter.sent]
+        assert any(
+            "deferred" in c.lower() or "still streaming" in c.lower() for c in sent
+        ), f"turn-hold must send deferral notice, got: {sent}"
+    finally:
+        original_error = sys.exc_info()[1]
+        try:
+            release_worker.set()
+            await _drain_deferred(runner)
+            if FencedStreamingAgent.last_instance is not None:
+                assert await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
+                assert cleanup_done.is_set()
+        except BaseException as cleanup_error:
+            if original_error is None:
+                raise
+            original_error.add_note(
+                f"Turn-hold cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
 
 @pytest.mark.asyncio
