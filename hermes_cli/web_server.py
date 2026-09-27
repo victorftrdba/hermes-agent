@@ -100,11 +100,13 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             from hermes_cli.profiles import profiles_to_serve
 
             profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
+            if profile_homes:
                 start_kwargs["profile_homes"] = profile_homes
                 # Stand down, per tick, for a profile whose OWN gateway runs:
                 # it ticks with live adapters, and the tick-lock race would
                 # otherwise deliver through the standalone path (#100489).
+                # The gate is re-evaluated on every tick, so the desktop
+                # resumes a profile once its gateway stops.
                 from hermes_cli.profiles import _check_gateway_running
 
                 start_kwargs["profile_gate"] = lambda _name, home: not _check_gateway_running(Path(home))

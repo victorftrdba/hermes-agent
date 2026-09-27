@@ -31,6 +31,8 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 19. Telegram request construction and reconnect never execute the macOS system-proxy probe on the Gateway event-loop thread. Repeated proxy resolution shares a bounded process-wide probe result, including failures, while explicit environment precedence, `NO_PROXY`, `gateway.trust_env`, non-macOS behavior, and refresh after the bounded TTL remain unchanged.
 20. Telegram adapter import may load transport primitives but never imports the separate discovery-producer module. Request construction runs the complete fallback-IP discovery producer — its lazy module import, coroutine creation, `AsyncClient` construction, DNS and DoH — off the Gateway event-loop thread and under one configured discovery deadline. Import, construction, and discovery errors or expiry fail closed to seed IPv4 via the existing fallback transport; configured and disabled fallback-IP behavior is unchanged.
 21. Within one process, only the newest Telegram adapter for a bot token may publish connected state or polling side effects. A cancellation-resistant predecessor is synchronously fenced, its PTB polling stop is armed, and its later completion or disconnect cannot revoke or degrade the replacement.
+22. The startup-liveness watchdog arms only in the primary process. A `multiprocessing` child that inherits a `gateway run` argv (cron child, SessionDB bootstrap, any spawn worker) must not arm its own watchdog, while the primary-process path still arms before the heavy import graph. Process identity comes from `multiprocessing.current_process().name`, never `__name__` alone, on both the console-script and direct-module entry paths.
+23. The desktop in-process cron ticker passes `profile_homes` and the dynamic per-tick `profile_gate` whenever `profiles_to_serve(multiplex=True)` returns one or more profiles, single-profile included: a profile whose own gateway is live owns its ticks, and the desktop resumes that profile when the gateway later stops. External cron providers and profile-enumeration failure keep their current single-store behavior.
 
 ## Non-goals
 
@@ -125,6 +127,15 @@ Cache only the macOS `scutil --proxy` result behind a short monotonic TTL, inclu
 
 Keep transport primitives in the eagerly imported network module and isolate the lazy discovery producer in its own module. Run its import, coroutine creation, `AsyncClient` construction, DNS and DoH inside one bounded worker. On any bounded producer error or expiry, use seed fallback IPs and the existing transport. Preserve configured and disabled fallback-IP behavior, timeout normalization, logs, proxy order, and monkeypatch seams.
 
+### PR 11: Primary-process watchdog gate and desktop single-profile ticker ownership
+
+- `hermes_cli/main.py`
+- `hermes_cli/web_server.py`
+- `tests/gateway/test_startup_watchdog.py`
+- `tests/hermes_cli/test_desktop_cron_ticker_profiles.py`
+
+Gate the early gateway-run watchdog arm on primary-process identity so multiprocessing children cannot arm a watchdog from inherited argv, and extend the desktop builtin ticker's `profile_homes` + dynamic `profile_gate` to the single-profile case so a profile is skipped while its own gateway is live and resumed once it stops.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
@@ -150,6 +161,8 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 19 | `tests/gateway/test_proxy_mode.py` proves bounded success/failure caching, TTL/reset behavior, non-macOS no-fork behavior, and event-loop progress while Telegram request construction waits on a deliberately blocked system-proxy probe |
 | 20 | `tests/gateway/test_telegram_cold_network_import.py` proves adapter import excludes the discovery module and a blocked producer import leaves the loop responsive, then expires to seeded fallback transports; `tests/gateway/test_telegram_polling_progress.py` covers blocked discovery and normalized deadlines |
 | 21 | `tests/gateway/test_telegram_connect_ownership.py` overlaps two same-token connects, proves the successor arms the predecessor's PTB stop event, and verifies the stale completion and disconnect cannot publish health, enter fatal conflict, or release the replacement's ownership |
+| 22 | `tests/gateway/test_startup_watchdog.py` proves a spawned child given `gateway run` argv stays unarmed while the MainProcess path still arms |
+| 23 | `tests/hermes_cli/test_desktop_cron_ticker_profiles.py` proves the single-profile desktop builtin receives `profile_homes` and a gate that rejects a live own gateway and accepts once it stops; external-provider and enumeration-failure behavior unchanged |
 
 ## Risks and mitigations
 

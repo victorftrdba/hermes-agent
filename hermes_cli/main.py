@@ -66,14 +66,36 @@ def _argv_is_gateway_run(argv: list) -> bool:
     return any(a == "gateway" and b == "run" for a, b in zip(argv, argv[1:]))
 
 
-if _argv_is_gateway_run(sys.argv[1:]):
+def _is_primary_process() -> bool:
+    """False inside multiprocessing children, which must never arm the watchdog.
+
+    Spawn children inherit the parent's ``sys.argv`` — ``gateway run`` included —
+    so an argv match alone would arm a 300s hard-exit timer inside every worker a
+    gateway spawns (cron child, SessionDB bootstrap). ``current_process().name``
+    is ``"MainProcess"`` only for the interpreter's own process; ``__name__`` is
+    not reliable (spawn re-imports the entry module as ``__mp_main__``). Falls
+    back to True so a missing stdlib module can never disable the watchdog.
+    """
+    try:
+        from multiprocessing import current_process
+
+        return current_process().name == "MainProcess"
+    except Exception:
+        return True
+
+
+def _maybe_arm_startup_watchdog(argv: list) -> None:
+    if not _argv_is_gateway_run(argv) or not _is_primary_process():
+        return
     try:
         from hermes_startup_watchdog import arm_startup_watchdog as _arm_sw
 
         _arm_sw()
-        del _arm_sw
     except Exception:
         pass
+
+
+_maybe_arm_startup_watchdog(sys.argv[1:])
 
 
 def _exit_after_oneshot(rc: object) -> None:
