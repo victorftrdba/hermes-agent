@@ -149,6 +149,8 @@ Gate the early gateway-run watchdog arm on primary-process identity so multiproc
 
 Create the single gateway-owned executor eagerly at construction and remove the lifecycle mutex from executor access so dispatch cannot wait behind a thread parked in the old critical section. Gate and detach the pool before draining it, and join running workers within the bounded drain before `SessionDB.close()` so a late submit cannot resurrect work. Leave heartbeat watch restoration's index and live watches untouched on a rejected dispatch so the next poll retries with the pool attached, and keep runner fixtures constructing the stable pool.
 
+Full-CI fixture compatibility remains part of criterion25: use one non-autouse test-owned executor attachment fixture with explicit wiring for bare runners that bypass the production constructor. Cover attachment idempotence, existing-pool preservation, closing/closed refusal and deterministic fixture-owned worker teardown. Preserve every existing behavioral assertion and deliberately controlled lifecycle pool. Require the affected gateway/cron/cleanup tests and fresh exact-head full CI; do not restore lazy production initialization or a lifecycle mutex to accommodate tests.
+
 ### Activation
 
 Install the exact validated SHA, drain active work, restart the supervised Gateway, and collect live evidence separately from source, PR, and test evidence. Roll back to the prior exact SHA and restart if the bounded smoke regresses.
