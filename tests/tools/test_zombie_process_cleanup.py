@@ -461,6 +461,7 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
+        from tools.daemon_pool import DaemonThreadPoolExecutor
         from tools.delegate_tool import _run_single_child
 
         relay_runtime._reset_for_tests()
@@ -494,7 +495,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                assert release_child.wait(timeout=5)
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -511,6 +512,28 @@ class TestDelegationCleanup:
                 child_finished.set()
 
         child.run_conversation.side_effect = run_conversation
+        test_thread_id = threading.get_ident()
+        captured_futures = []
+        start_gates = []
+        real_submit = DaemonThreadPoolExecutor.submit
+
+        def submit(executor, fn, /, *args, **kwargs):
+            caller = sys._getframe(1)
+            intended_child = (
+                not captured_futures
+                and threading.get_ident() == test_thread_id
+                and executor._max_workers == 1
+                and caller.f_code.co_name == "await_child"
+                and caller.f_globals.get("__name__") == "tools.delegate_tool_child_run"
+                and getattr(caller.f_locals.get("self"), "child", None) is child
+            )
+            future = real_submit(executor, fn, *args, **kwargs)
+            if intended_child:
+                captured_futures.append(future)
+                start_gates.append(child_started.wait(timeout=5))
+            return future
+
+        monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit)
         try:
             result = _run_single_child(
                 task_index=0,
@@ -519,6 +542,7 @@ class TestDelegationCleanup:
                 parent_agent=parent,
             )
 
+            assert start_gates == [True]
             assert child_started.is_set()
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
@@ -535,5 +559,12 @@ class TestDelegationCleanup:
             )
         finally:
             release_child.set()
-            reset_hermes_home_override(profile_token)
-            relay_runtime._reset_for_tests()
+            assert len(captured_futures) == 1
+            future = captured_futures[0]
+            try:
+                future.result(timeout=5)
+                assert all(future.done() for future in captured_futures)
+            finally:
+                if future.done():
+                    reset_hermes_home_override(profile_token)
+                    relay_runtime._reset_for_tests()
