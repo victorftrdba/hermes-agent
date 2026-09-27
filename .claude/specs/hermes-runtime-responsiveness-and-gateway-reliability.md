@@ -33,6 +33,7 @@ Telegram recovery already retains a single owned retry task, Desktop resume alre
 21. Within one process, only the newest Telegram adapter for a bot token may publish connected state or polling side effects. A cancellation-resistant predecessor is synchronously fenced, its PTB polling stop is armed, and its later completion or disconnect cannot revoke or degrade the replacement.
 22. The startup-liveness watchdog arms only in the primary process. A `multiprocessing` child that inherits a `gateway run` argv (cron child, SessionDB bootstrap, any spawn worker) must not arm its own watchdog, while the primary-process path still arms before the heavy import graph. Process identity comes from `multiprocessing.current_process().name`, never `__name__` alone, on both the console-script and direct-module entry paths.
 23. The desktop in-process cron ticker passes `profile_homes` and the dynamic per-tick `profile_gate` whenever `profiles_to_serve(multiplex=True)` returns one or more profiles, single-profile included: a profile whose own gateway is live owns its ticks, and the desktop resumes that profile when the gateway later stops. External cron providers and profile-enumeration failure keep their current single-store behavior.
+24. Compression summary failures (empty content and length-truncated output) attribute the provider/model actually selected for the auxiliary call via `route_info`, not the main provider/model, with the existing instance fields used only when `route_info` is absent. Compression persistence, main-model fallback, cooldown, token-cap policy, and model routing are unchanged, and the no-partial-summary guard remains intact.
 
 ## Non-goals
 
@@ -163,6 +164,7 @@ Install the exact validated SHA, drain active work, restart the supervised Gatew
 | 21 | `tests/gateway/test_telegram_connect_ownership.py` overlaps two same-token connects, proves the successor arms the predecessor's PTB stop event, and verifies the stale completion and disconnect cannot publish health, enter fatal conflict, or release the replacement's ownership |
 | 22 | `tests/gateway/test_startup_watchdog.py` proves a spawned child given `gateway run` argv stays unarmed while the MainProcess path still arms |
 | 23 | `tests/hermes_cli/test_desktop_cron_ticker_profiles.py` proves the single-profile desktop builtin receives `profile_homes` and a gate that rejects a live own gateway and accepts once it stops; external-provider and enumeration-failure behavior unchanged |
+| 24 | `tests/agent/test_context_compressor.py` proves a `route_info`-updated auxiliary route appears in the truncated-summary error instead of the main model |
 
 ## Risks and mitigations
 
