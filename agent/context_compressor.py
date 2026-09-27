@@ -3247,7 +3247,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             raise AuxiliaryExplicitCancellation()
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
-        where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
+        # Attribute the failure to the route call_llm actually selected (``route_info``), not the main
+        # provider/model: a compression failure whose report names the main model sends operators chasing
+        # the wrong backend (production: gemini-2.5-flash summary misreported as deepseek-v4.1-flash).
+        _aux_provider = _aux_route.get("provider") or self.provider or "auto"
+        where = f"(provider={_aux_provider} model={_aux_model})"
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
         # payload passes ``_validate_llm_response`` (a ``message`` exists), so it reaches here and would

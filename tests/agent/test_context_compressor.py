@@ -808,6 +808,46 @@ class TestSummaryFailureCooldown:
         assert mock_call.call_count == 1
 
 
+class TestSummaryFailureRouteAttribution:
+    """A compression failure must name the route ``call_llm`` actually selected.
+
+    Production evidence: ``session_model_usage`` recorded the compression task on
+    ``openrouter/google/gemini-2.5-flash`` (output_tokens=65535), but the
+    ``finish_reason=length`` RuntimeError reported the main
+    ``openrouter/deepseek-v4.1-flash`` pair because it formatted the instance
+    fields instead of the ``route_info`` the auxiliary client populates.
+    """
+
+    def test_truncated_summary_error_reports_route_info_pair(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="deepseek/deepseek-v4.1-flash",
+                provider="openrouter",
+                quiet_mode=True,
+            )
+
+        def fake_call_llm(**kwargs):
+            route_info = kwargs.get("route_info")
+            if route_info is not None:
+                route_info["provider"] = "openrouter"
+                route_info["model"] = "google/gemini-2.5-flash"
+            return {"choices": [{"message": {"content": "partial summary"}, "finish_reason": "length"}]}
+
+        messages = [
+            {"role": "user", "content": "do something"},
+            {"role": "assistant", "content": "ok"},
+        ]
+        with patch("agent.context_compressor.call_llm", side_effect=fake_call_llm):
+            summary = c._generate_summary(messages)
+
+        assert summary is None
+        assert c._last_summary_truncated_failure is True
+        error = c._last_summary_error or ""
+        assert "provider=openrouter" in error
+        assert "model=google/gemini-2.5-flash" in error
+        assert "deepseek/deepseek-v4.1-flash" not in error
+
+
 class TestAuthFailureAborts:
     """A 401/403 on the summary call must ABORT compression (preserve the
     session unchanged) instead of rotating into a degraded child session
