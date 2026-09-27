@@ -13,6 +13,7 @@ live-PID zombie.
 from __future__ import annotations
 
 import json
+import multiprocessing
 import threading
 import time
 from pathlib import Path
@@ -75,6 +76,37 @@ def exit_capture(monkeypatch):
     capture = _ExitCapture()
     monkeypatch.setattr(StartupWatchdogHandle, "_exit", staticmethod(capture))
     return capture
+
+
+_CHILD_GATEWAY_ARGV = ["hermes", "gateway", "run"]
+
+
+def _spawned_child_watchdog_probe(conn) -> None:
+    """Spawn-child side of the primary-process gate test.
+
+    Reproduces a spawn child's inherited state — ``sys.argv`` carrying
+    ``gateway run`` — and reports whether ``hermes_cli.main`` armed the
+    watchdog. When the module was already imported by the spawn bootstrap the
+    explicit call covers the same gate.
+    """
+    import sys
+
+    import hermes_startup_watchdog as child_sw
+
+    child_sw._reset_for_tests()
+    was_imported = "hermes_cli.main" in sys.modules
+    sys.argv = list(_CHILD_GATEWAY_ARGV)
+    try:
+        import hermes_cli.main as child_main
+
+        if was_imported:
+            child_main._maybe_arm_startup_watchdog(_CHILD_GATEWAY_ARGV[1:])
+        with child_sw._handle_lock:
+            armed = child_sw._handle is not None
+        conn.send(armed)
+    finally:
+        child_sw.disarm_startup_watchdog()
+        conn.close()
 
 
 class TestContracts:
@@ -165,6 +197,42 @@ class TestContracts:
                         calls.append(node.lineno)
             assert calls, f"{rel} has no arm_startup_watchdog call ({reason})"
 
+
+class TestPrimaryProcessGate:
+    """Spawn children inherit the parent's ``gateway run`` argv; they must not
+    arm a watchdog whose hard-exit timer belongs to the gateway process."""
+
+    def test_main_process_with_gateway_argv_still_arms(self):
+        import hermes_cli.main as main_mod
+
+        main_mod._maybe_arm_startup_watchdog(["gateway", "run"])
+        try:
+            with sw._handle_lock:
+                handle = sw._handle
+            assert handle is not None
+            assert handle.is_alive()
+        finally:
+            disarm_startup_watchdog()
+
+    def test_spawned_child_with_gateway_argv_cannot_arm(self):
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        proc = ctx.Process(
+            target=_spawned_child_watchdog_probe, args=(child_conn,)
+        )
+        proc.daemon = True
+        proc.start()
+        child_conn.close()
+        try:
+            assert parent_conn.poll(60), "spawn child produced no result"
+            assert parent_conn.recv() is False
+        finally:
+            parent_conn.close()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+        assert proc.exitcode == 0
 
 
 class TestConfigResolution:

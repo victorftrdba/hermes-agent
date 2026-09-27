@@ -68,21 +68,34 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs is not None
     assert builtin.start_kwargs["interval"] == 7
     assert builtin.start_kwargs["profile_homes"] == homes
+    assert callable(builtin.start_kwargs["profile_gate"])
 
 
-def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
+def test_single_profile_gets_homes_and_dynamic_gate(monkeypatch, _providers, tmp_path):
+    """One profile still needs the per-tick gate: a live own gateway owns the
+    tick, and the desktop must resume once that gateway stops."""
     _sp, builtin = _providers
+    home = tmp_path / "root"
     import hermes_cli.profiles as profiles_mod
 
     monkeypatch.setattr(
         profiles_mod,
         "profiles_to_serve",
-        lambda **_kw: [("default", tmp_path / "root")],
+        lambda **_kw: [("default", home)],
+    )
+    live = {"gateway": True}
+    monkeypatch.setattr(
+        profiles_mod, "_check_gateway_running", lambda _home: live["gateway"]
     )
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    assert builtin.start_kwargs["interval"] == 9
+    assert builtin.start_kwargs["profile_homes"] == [("default", home)]
+    gate = builtin.start_kwargs["profile_gate"]
+    assert gate("default", home) is False
+    live["gateway"] = False
+    assert gate("default", home) is True
 
 
 def test_enumeration_failure_fails_open(monkeypatch, _providers):
