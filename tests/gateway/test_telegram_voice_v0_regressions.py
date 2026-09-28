@@ -25,8 +25,8 @@ def _source():
     return SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
 
 
-def _runner(adapter=None):
-    runner = object.__new__(GatewayRunner)
+def _runner(adapter=None, *, attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = SimpleNamespace(
         stt_enabled=True,
         group_sessions_per_user=True,
@@ -104,8 +104,8 @@ class _PendingVoiceAgent:
         }
 
 
-def _run_agent_runner(adapter):
-    runner = _runner(adapter)
+def _run_agent_runner(adapter, attach_gateway_executor):
+    runner = _runner(adapter, attach_gateway_executor=attach_gateway_executor)
     runner._voice_mode = {}
     runner._prefill_messages = []
     runner._ephemeral_system_prompt = ""
@@ -123,9 +123,9 @@ def _run_agent_runner(adapter):
 
 
 @pytest.mark.asyncio
-async def test_pending_voice_interrupt_reuses_transcript_and_echo():
+async def test_pending_voice_interrupt_reuses_transcript_and_echo(attach_gateway_executor):
     adapter = SimpleNamespace(send=AsyncMock())
-    runner = _runner(adapter)
+    runner = _runner(adapter, attach_gateway_executor=attach_gateway_executor)
     source = _source()
     event = MessageEvent(
         text="",
@@ -176,6 +176,7 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
 async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
     monkeypatch,
     tmp_path,
+    attach_gateway_executor,
 ):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
     monkeypatch.setenv("HERMES_GATEWAY_NOTIFY_INTERVAL", "0")
@@ -183,7 +184,7 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
     monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=_PendingVoiceAgent))
 
     adapter = _PendingVoiceAdapter()
-    runner = _run_agent_runner(adapter)
+    runner = _run_agent_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     source = _source()
     session_key = "telegram:dm:12345"
     event = MessageEvent(
@@ -275,5 +276,4 @@ def _voice_event(source, urls):
         media_urls=list(urls),
         media_types=["audio/ogg"] * len(urls),
     )
-
 

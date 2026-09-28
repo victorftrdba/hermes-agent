@@ -33,10 +33,10 @@ def _make_history() -> list[dict[str, str]]:
     ]
 
 
-def _make_runner(history: list[dict[str, str]]):
+def _make_runner(history: list[dict[str, str]], attach_gateway_executor):
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -59,11 +59,11 @@ def _make_runner(history: list[dict[str, str]]):
 
 
 @pytest.mark.asyncio
-async def test_compress_focus_topic_passed_to_agent():
+async def test_compress_focus_topic_passed_to_agent(attach_gateway_executor):
     """Focus topic from /compress <focus> is passed through to _compress_context."""
     history = _make_history()
     compressed = [history[0], history[-1]]
-    runner = _make_runner(history)
+    runner = _make_runner(history, attach_gateway_executor=attach_gateway_executor)
     agent_instance = MagicMock()
     agent_instance.context_compressor.has_content_to_compress.return_value = True
     agent_instance.session_id = "sess-1"
@@ -88,5 +88,4 @@ async def test_compress_focus_topic_passed_to_agent():
 
     # Verify focus is mentioned in response
     assert 'Focus: "database schema"' in result
-
 

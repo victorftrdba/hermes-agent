@@ -16,6 +16,7 @@ nothing.
 
 from __future__ import annotations
 
+import concurrent.futures
 from pathlib import Path
 
 import pytest
@@ -40,11 +41,18 @@ def runner():
     class _Runner(GatewaySlashCommandsMixin):
         _run_in_executor_with_context = GatewayRunner._run_in_executor_with_context
         _get_executor = GatewayRunner._get_executor
+        _shutdown_executor = GatewayRunner._shutdown_executor
 
     r = _Runner()
     r.adapters = {}
     r._pending_skills_reload_notes = {}
-    return r
+    r._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=10, thread_name_prefix="hermes-gateway")
+    r._executor_closing = False
+    try:
+        yield r
+    finally:
+        r._shutdown_executor()
 
 
 class _Event:

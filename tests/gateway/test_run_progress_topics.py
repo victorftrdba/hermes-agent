@@ -456,11 +456,11 @@ class DelayedInterimAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -482,7 +482,7 @@ def _make_runner(adapter):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch, tmp_path):
+async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch, tmp_path, attach_gateway_executor):
     """Slack DM progress should keep event ts fallback threading."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
     # Since PR #8006, Slack's built-in display tier sets tool_progress="off"
@@ -503,7 +503,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.SLACK)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -536,7 +536,7 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path):
+async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path, attach_gateway_executor):
     """Relay Discord channel-initiate: the thread doesn't exist at ingest, so
     the connector auto-threads on the reply anchor and stamps
     prospective_thread_id. The tool-progress / status bubbles must carry that
@@ -559,7 +559,7 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -598,7 +598,7 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, tmp_path):
+async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, tmp_path, attach_gateway_executor):
     """A message ARRIVING in an existing Discord thread (not the relay
     auto-thread lane) must NOT get the synthetic prospective anchor — it already
     routes by its real thread. Guards against over-broadening the relay fix."""
@@ -618,7 +618,7 @@ async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, t
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -678,7 +678,7 @@ def _extract_progress_preview(content: str) -> str | None:
     return None
 
 
-def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
+def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0, *, attach_gateway_executor):
     """Shared setup for long-preview truncation tests.
 
     Returns (adapter, result) after running the agent with LongPreviewAgent.
@@ -703,7 +703,7 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
     (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
 
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -728,9 +728,9 @@ def _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0):
     return adapter, result
 
 
-def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
+def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path, attach_gateway_executor):
     """When tool_preview_length is explicitly set (e.g. 120), all/new mode uses that."""
-    adapter, result = _run_long_preview_helper(monkeypatch, tmp_path, preview_length=120)
+    adapter, result = _run_long_preview_helper(monkeypatch, tmp_path, preview_length=120, attach_gateway_executor=attach_gateway_executor)
     assert result["final_response"] == "done"
     assert adapter.sent
     content = adapter.sent[0]["content"]
@@ -743,7 +743,7 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
     assert len(preview_text) <= 120, f"Preview too long ({len(preview_text)}): {preview_text}"
 
 
-def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
+def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path, attach_gateway_executor):
     """The real gateway path must retain the URL beyond its visible cap."""
     import yaml
 
@@ -763,7 +763,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     )
 
     adapter = DiscordProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -1007,6 +1007,7 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    attach_gateway_executor,
 ):
     if config_data:
         import yaml
@@ -1022,7 +1023,7 @@ async def _run_with_agent(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = adapter_cls(platform=platform)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1060,7 +1061,8 @@ async def _run_with_agent(
 
 @pytest.mark.asyncio
 async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1076,6 +1078,7 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
         adapter_cls=NativeTaskCardAdapter,
         user_id="U1",
         scope_id="T1",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "done"
@@ -1106,7 +1109,8 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
 
 @pytest.mark.asyncio
 async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1119,6 +1123,7 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         adapter_cls=FailingNativeTaskCardAdapter,
         user_id="U1",
         scope_id="T1",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "done"
@@ -1133,7 +1138,7 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
 
 
 @pytest.mark.asyncio
-async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatch, tmp_path):
+async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatch, tmp_path, attach_gateway_executor):
     """A transient split edit must retain can_edit and the current message ID."""
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1151,6 +1156,7 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
         chat_type="direct",
         thread_id="1700000000.000100",
         adapter_cls=RetryableOverflowEditProgressAdapter,
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "done"
@@ -1164,7 +1170,7 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, tmp_path):
+async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, tmp_path, attach_gateway_executor):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1177,6 +1183,7 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
             },
             "streaming": {"enabled": False},
         },
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result.get("already_sent") is not True
@@ -1208,7 +1215,7 @@ class TransformedStreamAgent:
 
 
 @pytest.mark.asyncio
-async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
+async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path, attach_gateway_executor):
     """When a transform_llm_output hook modifies the response after streaming,
     the gateway must edit the existing streamed message in place with the full
     transformed content (so plugins like content filters / appenders reach the
@@ -1228,6 +1235,7 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
         chat_type="group",
         thread_id="$thread",
         adapter_cls=MetadataEditProgressCaptureAdapter,
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     # Final delivery happened (no duplicate send fallback).
@@ -1241,7 +1249,7 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
+async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path, attach_gateway_executor):
     QueuedCommentaryAgent.calls = 0
     adapter, result = await _run_with_agent(
         monkeypatch,
@@ -1250,6 +1258,7 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
         session_id="sess-queued-commentary",
         pending_text="queued follow-up",
         config_data={"display": {"interim_assistant_messages": True}},
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     sent_texts = [call["content"] for call in adapter.sent]
@@ -1259,7 +1268,7 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 
 @pytest.mark.asyncio
-async def test_run_agent_queued_message_delivers_first_response_media(monkeypatch, tmp_path):
+async def test_run_agent_queued_message_delivers_first_response_media(monkeypatch, tmp_path, attach_gateway_executor):
     """Queued follow-ups must preserve explicit attachments from the first turn."""
     media_path = tmp_path / "queued-first-response.png"
     media_path.write_bytes(b"not-a-real-png-but-a-real-file")
@@ -1277,6 +1286,7 @@ async def test_run_agent_queued_message_delivers_first_response_media(monkeypatc
         chat_type="group",
         thread_id="discord-thread",
         adapter_cls=MediaCaptureProgressAdapter,
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "follow-up processed"
@@ -1299,6 +1309,7 @@ async def test_run_agent_queued_message_delivers_first_response_media(monkeypatc
 @pytest.mark.asyncio
 async def test_run_agent_queued_message_delivers_streamed_first_response_media(
     monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Streaming first-turn text must not suppress its explicit attachment."""
     media_path = tmp_path / "queued-streamed-first-response.png"
@@ -1321,6 +1332,7 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
         chat_type="group",
         thread_id="discord-thread",
         adapter_cls=MediaCaptureProgressAdapter,
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "follow-up processed"
@@ -1339,6 +1351,7 @@ async def test_run_agent_queued_message_delivers_streamed_first_response_media(
 @pytest.mark.asyncio
 async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_followup(
     monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Regression: queued direct-send must not leak NO_REPLY to the channel."""
     QueuedSilenceAgent.calls = 0
@@ -1351,6 +1364,7 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
         platform=Platform.SLACK,
         chat_id="C123",
         thread_id="1712345678.000100",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     sent_texts = [call["content"] for call in adapter.sent]
@@ -1362,6 +1376,7 @@ async def test_run_agent_suppresses_silent_first_turn_and_processes_queued_follo
 @pytest.mark.asyncio
 async def test_run_agent_sends_normalized_failure_before_queued_followup(
     monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Queued delivery uses finalized output, not the raw empty agent result."""
     QueuedFailedEmptyAgent.calls = 0
@@ -1374,6 +1389,7 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
         platform=Platform.SLACK,
         chat_id="C123",
         thread_id="1712345678.000100",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     sent_texts = [call["content"] for call in adapter.sent]
@@ -1383,13 +1399,14 @@ async def test_run_agent_sends_normalized_failure_before_queued_followup(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
+async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path, attach_gateway_executor):
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
         BackgroundReviewAgent,
         session_id="sess-bg-review-order",
         config_data={"display": {"interim_assistant_messages": True}},
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "done"
@@ -1499,7 +1516,7 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
 
 
 @pytest.mark.asyncio
-async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path):
+async def test_run_agent_drops_tool_progress_after_generation_invalidation(monkeypatch, tmp_path, attach_gateway_executor):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -1517,7 +1534,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
     import tools.terminal_tool  # noqa: F401 - register terminal tool metadata
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1561,7 +1578,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 
 @pytest.mark.asyncio
-async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
+async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path, attach_gateway_executor):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -1578,7 +1595,7 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1647,7 +1664,7 @@ async def test_keep_typing_stops_immediately_when_interrupt_event_is_set():
 
 
 @pytest.mark.asyncio
-async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_path):
+async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_path, attach_gateway_executor):
     """Verbose mode with default tool_preview_length (0) should NOT truncate args.
 
     Previously, verbose mode capped args at 200 chars when tool_preview_length
@@ -1659,6 +1676,7 @@ async def test_verbose_mode_does_not_truncate_args_by_default(monkeypatch, tmp_p
         VerboseAgent,
         session_id="sess-verbose-no-truncate",
         config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"] == "done"
@@ -1697,7 +1715,7 @@ class TerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path):
+async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path, attach_gateway_executor):
     """Terminal progress on a markdown-capable (supports_code_blocks) gateway
     renders a bare fenced code block — no language tag (Slack mrkdwn would print
     'bash' as a literal first code line).  In non-verbose ("all"/"new") mode the
@@ -1715,7 +1733,7 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1752,7 +1770,7 @@ async def test_terminal_progress_renders_fenced_code_block(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path):
+async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_path, attach_gateway_executor):
     """Verbose mode on a markdown-capable gateway renders the FULL multi-line
     command in a bare fenced block (no truncation, no 'bash' tag).  This is the
     parity guarantee for #42634: verbose keeps full detail, non-verbose caps."""
@@ -1768,7 +1786,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1800,7 +1818,7 @@ async def test_terminal_progress_verbose_shows_full_command(monkeypatch, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_path):
+async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_path, attach_gateway_executor):
     """#41215 also rendered the bash block in verbose mode. The revert removed it
     from both branches, so verbose progress must not emit a fenced ```bash block
     either (verbose still shows args by opt-in, just not as a code block)."""
@@ -1816,7 +1834,7 @@ async def test_terminal_progress_no_bash_block_in_verbose_mode(monkeypatch, tmp_
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
@@ -1862,7 +1880,7 @@ class MultiTerminalCommandAgent:
 
 
 @pytest.mark.asyncio
-async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_path):
+async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_path, attach_gateway_executor):
     """Back-to-back terminal calls render ONE "terminal" header followed by
     adjacent code blocks; a different tool in between resets the header so the
     next terminal call gets a fresh one."""
@@ -1878,7 +1896,7 @@ async def test_consecutive_terminal_progress_collapses_headers(monkeypatch, tmp_
     import tools.terminal_tool  # noqa: F401 - register terminal emoji
 
     adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})

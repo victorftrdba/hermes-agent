@@ -3457,9 +3457,13 @@ class GatewayRunner(
         self._booted_from_restart: bool = False
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
-        self._executor_lock = threading.Lock()
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-        # Set on gateway stop so the recreate-on-shutdown path can't resurrect the pool.
+        # ONE stable pool for all blocking agent work, created eagerly at construction (threads spawn
+        # lazily on submit). _get_executor never mints a replacement, so a late caller cannot resurrect
+        # a fresh pool against the already-closed SessionDB (#101093).
+        self._executor: concurrent.futures.ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="hermes-gateway")
+        # One-way stop gate: _shutdown_executor sets this BEFORE draining the detached pool, so every
+        # later submission fails fast instead of landing writes after SessionDB.close() (#101093).
         self._executor_closing = False
         # ALL per-session state lives here (gateway/session_state.py); use _session_state / _peek_session_state.
         self._sessions: Dict[str, SessionState] = {}
@@ -4148,33 +4152,29 @@ class GatewayRunner(
         return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
-        """Return the gateway-owned executor for blocking agent work."""
-        lock = getattr(self, "_executor_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self._executor_lock = lock
-        with lock:
-            if getattr(self, "_executor_closing", False):
-                raise RuntimeError("Gateway is shutting down; executor unavailable")
-            executor = getattr(self, "_executor", None)
-            if executor is None or getattr(executor, "_shutdown", False):
-                executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10, thread_name_prefix="hermes-gateway")
-                self._executor = executor
-            return executor
+        """Return the gateway-owned executor for blocking agent work.
+
+        Non-blocking and non-minting: the pool is built once in ``_init_lifecycle_state`` and only
+        detached by ``_shutdown_executor``. While shutting down (or once detached) this raises instead
+        of rebuilding a pool whose writes would race the closed SessionDB — a caller that reaches here
+        late must fail fast, never resurrect work (#101093)."""
+        if getattr(self, "_executor_closing", False):
+            raise RuntimeError("Gateway is shutting down; executor unavailable")
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            raise RuntimeError("Gateway executor unavailable")
+        return executor
 
     def _shutdown_executor(self, drain_timeout: float = 0.0) -> int:
         """Stop the gateway-owned executor; returns the number of worker threads still running.
         ``drain_timeout=0`` is fire-and-forget; shutdown passes a bounded budget so blocking DB work
         cannot outlive ``SessionDB.close()``. ``cancel_futures`` only drops unstarted work and cancelling
-        a ``run_in_executor`` awaitable does not stop its thread, so running workers are joined."""
-        lock = getattr(self, "_executor_lock", None)
-        if lock is None:
-            return 0
-        with lock:
-            self._executor_closing = True
-            executor = getattr(self, "_executor", None)
-            self._executor = None
+        a ``run_in_executor`` awaitable does not stop its thread, so running workers are joined.
+        The closing gate and the detach both land before any draining, so a late ``_get_executor``
+        raises instead of resolving a pool that is shutting down over the closing DB (#101093)."""
+        self._executor_closing = True
+        executor = getattr(self, "_executor", None)
+        self._executor = None
         if executor is None:
             return 0
         try:

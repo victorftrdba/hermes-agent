@@ -129,11 +129,11 @@ class PartialTruncationAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -153,7 +153,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_once(monkeypatch, tmp_path, agent_cls, session_id, attach_gateway_executor):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -165,7 +165,7 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     adapter = ProgressCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -191,9 +191,9 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
 
 
 @pytest.mark.asyncio
-async def test_baseline_non_interrupted_agent_renders_progress(monkeypatch, tmp_path):
+async def test_baseline_non_interrupted_agent_renders_progress(monkeypatch, tmp_path, attach_gateway_executor):
     """Sanity check: when is_interrupted is False, tool-progress renders normally."""
-    adapter, result = await _run_once(monkeypatch, tmp_path, PreInterruptAgent, "sess-baseline")
+    adapter, result = await _run_once(monkeypatch, tmp_path, PreInterruptAgent, "sess-baseline", attach_gateway_executor=attach_gateway_executor)
     assert result["final_response"] == "done"
     rendered = " ".join(c["content"] for c in adapter.sent) + " " + " ".join(
         c["content"] for c in adapter.edits
@@ -205,10 +205,11 @@ async def test_baseline_non_interrupted_agent_renders_progress(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path):
+async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path, attach_gateway_executor):
     """Messaging gateways should not echo raw truncation errors as final text."""
     adapter, result = await _run_once(
-        monkeypatch, tmp_path, PartialTruncationAgent, "sess-partial-empty"
+        monkeypatch, tmp_path, PartialTruncationAgent, "sess-partial-empty",
+        attach_gateway_executor=attach_gateway_executor,
     )
 
     assert result["final_response"].startswith("⚠️ Processing stopped:")
@@ -219,7 +220,7 @@ async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_path):
+async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_path, attach_gateway_executor):
     """Post-interrupt tool.started events must not render as bubbles.
 
     This is Bug B from the screenshot: user sends `stop`, agent acks with
@@ -229,7 +230,8 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
     is_interrupted and skip these events.
     """
     adapter, result = await _run_once(
-        monkeypatch, tmp_path, InterruptedAgent, "sess-interrupted"
+        monkeypatch, tmp_path, InterruptedAgent, "sess-interrupted",
+        attach_gateway_executor=attach_gateway_executor,
     )
     assert result["final_response"] == "interrupted"
 

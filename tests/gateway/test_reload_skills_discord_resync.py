@@ -134,7 +134,7 @@ class TestRegisterSkillGroupUsesInstanceState:
 class TestHandleReloadSkillsCallsRefreshSkillGroup:
     """Gateway-side integration: /reload-skills must call refresh on adapters."""
 
-    def test_orchestrator_calls_refresh_skill_group_on_every_adapter(self):
+    def test_orchestrator_calls_refresh_skill_group_on_every_adapter(self, attach_gateway_executor):
         """Sync + async refresh_skill_group implementations both get awaited/called.
 
         The orchestrator iterates ``self.adapters`` and calls
@@ -148,7 +148,7 @@ class TestHandleReloadSkillsCallsRefreshSkillGroup:
         # Import without constructing a real runner — test the method
         # directly against an ``object.__new__`` instance.
         from gateway.run import GatewayRunner
-        runner = object.__new__(GatewayRunner)
+        runner = attach_gateway_executor(object.__new__(GatewayRunner))
 
         sync_refresh = MagicMock(return_value=(5, 0))
         async_called = {"flag": False}

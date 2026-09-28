@@ -247,9 +247,9 @@ class _RecordlessFlagConsumer(GatewayStreamConsumer):
         self._delivered_commentary_texts = []
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
-    runner = object.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -273,7 +273,7 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id):
+async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id, attach_gateway_executor):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -310,7 +310,7 @@ async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id):
     )
 
     adapter = CaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     source = SessionSource(
         platform=Platform.DISCORD, chat_id="1534932197436424204", chat_type="group"
     )
@@ -327,7 +327,8 @@ async def _run_turn(monkeypatch, tmp_path, *, consumer_cls=None, session_id):
 
 @pytest.mark.asyncio
 async def test_recordless_delivery_flag_does_not_suppress_complete_response(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """#95382 boundary: flags claim delivery, nothing recorded, only the
     prefix visible — the complete response must NOT be suppressed."""
@@ -336,6 +337,7 @@ async def test_recordless_delivery_flag_does_not_suppress_complete_response(
         tmp_path,
         consumer_cls=_RecordlessFlagConsumer,
         session_id="sess-95382-recordless",
+        attach_gateway_executor=attach_gateway_executor,
     )
     assert result["final_response"] == FULL_RESPONSE
     # Pre-fix behavior: already_sent=True and the tail appears in NO platform
@@ -354,12 +356,14 @@ async def test_recordless_delivery_flag_does_not_suppress_complete_response(
 
 @pytest.mark.asyncio
 async def test_normal_streaming_turn_still_suppresses_exactly_once(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """Control: an honest streaming turn (finalize edit carries the full
     response) must still suppress the duplicate normal send."""
     adapter, result = await _run_turn(
-        monkeypatch, tmp_path, session_id="sess-95382-control"
+        monkeypatch, tmp_path, session_id="sess-95382-control",
+        attach_gateway_executor=attach_gateway_executor,
     )
     assert result["final_response"] == FULL_RESPONSE
     all_payloads = [c["content"] for c in adapter.sent] + [
@@ -372,7 +376,8 @@ async def test_normal_streaming_turn_still_suppresses_exactly_once(
 
 @pytest.mark.asyncio
 async def test_recordless_flag_with_dead_transport_leaves_normal_send(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path,
+    attach_gateway_executor,
 ):
     """#95382 incident shape: the reconciliation edit ALSO fails (dead
     transport). The gateway must NOT claim already_sent — the normal final
@@ -390,6 +395,7 @@ async def test_recordless_flag_with_dead_transport_leaves_normal_send(
         tmp_path,
         consumer_cls=_DeadEditRecordlessConsumer,
         session_id="sess-95382-dead-transport",
+        attach_gateway_executor=attach_gateway_executor,
     )
     assert result["final_response"] == FULL_RESPONSE
     assert not result.get("already_sent"), (

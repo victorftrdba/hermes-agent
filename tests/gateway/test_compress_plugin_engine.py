@@ -80,10 +80,10 @@ def _make_history() -> list[dict[str, str]]:
     ]
 
 
-def _make_runner(history: list[dict[str, str]]):
+def _make_runner(history: list[dict[str, str]], attach_gateway_executor):
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -106,7 +106,7 @@ def _make_runner(history: list[dict[str, str]]):
 
 
 @pytest.mark.asyncio
-async def test_compress_works_with_plugin_context_engine():
+async def test_compress_works_with_plugin_context_engine(attach_gateway_executor):
     """/compress must not call ContextCompressor-only private helpers.
 
     Uses a fake ContextEngine subclass that only implements the ABC —
@@ -117,7 +117,7 @@ async def test_compress_works_with_plugin_context_engine():
     """
     history = _make_history()
     compressed = [history[0], history[-1]]
-    runner = _make_runner(history)
+    runner = _make_runner(history, attach_gateway_executor=attach_gateway_executor)
 
     plugin_engine = _FakePluginEngine()
     agent_instance = MagicMock()
@@ -143,5 +143,4 @@ async def test_compress_works_with_plugin_context_engine():
     assert "_find_tail_cut_by_tokens" not in result
     # Happy path fired
     agent_instance._compress_context.assert_called_once()
-
 

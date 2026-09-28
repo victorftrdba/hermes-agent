@@ -47,12 +47,12 @@ def _make_agent():
     return agent
 
 
-def _make_runner(agent):
+def _make_runner(agent, attach_gateway_executor):
     import threading
 
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner._running_agents = {}
     runner._agent_cache = {SESSION_KEY: agent}
     runner._agent_cache_lock = threading.Lock()
@@ -71,7 +71,7 @@ class _Event:
 
 
 @pytest.mark.asyncio
-async def test_review_command_dispatches_background_subagent(monkeypatch):
+async def test_review_command_dispatches_background_subagent(monkeypatch, attach_gateway_executor):
     import tools.delegate_tool as dt
     from agent import review_engine as re_mod
 
@@ -100,7 +100,7 @@ async def test_review_command_dispatches_background_subagent(monkeypatch):
     monkeypatch.setattr(re_mod, "_load_review_credentials_cfg", lambda: None)
 
     agent = _make_agent()
-    runner = _make_runner(agent)
+    runner = _make_runner(agent, attach_gateway_executor=attach_gateway_executor)
     out = await runner._handle_review_command(_Event("check tests"))
 
     assert out == re_mod.format_dispatch_note({"status": "dispatched"})
@@ -124,17 +124,17 @@ async def test_review_command_dispatches_background_subagent(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_review_command_rejects_while_agent_running():
+async def test_review_command_rejects_while_agent_running(attach_gateway_executor):
     agent = _make_agent()
-    runner = _make_runner(agent)
+    runner = _make_runner(agent, attach_gateway_executor=attach_gateway_executor)
     runner._running_agents = {SESSION_KEY: object()}
     out = await runner._handle_review_command(_Event())
     assert "Agent is running" in out
 
 
 @pytest.mark.asyncio
-async def test_review_command_requires_cached_agent():
-    runner = _make_runner(None)
+async def test_review_command_requires_cached_agent(attach_gateway_executor):
+    runner = _make_runner(None, attach_gateway_executor=attach_gateway_executor)
     runner._agent_cache = {}
     out = await runner._handle_review_command(_Event())
     assert "send a message first" in out

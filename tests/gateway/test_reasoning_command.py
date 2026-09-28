@@ -26,9 +26,9 @@ def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", 
     return MessageEvent(text=text, source=source)
 
 
-def _make_runner():
+def _make_runner(attach_gateway_executor):
     """Create a bare GatewayRunner without calling __init__."""
-    runner = object.__new__(gateway_run.GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {}
     runner._ephemeral_system_prompt = ""
     runner._prefill_messages = []
@@ -71,7 +71,7 @@ class TestReasoningCommand:
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
 
     @pytest.mark.asyncio
-    async def test_reasoning_command_reloads_current_state_from_config(self, tmp_path, monkeypatch):
+    async def test_reasoning_command_reloads_current_state_from_config(self, tmp_path, monkeypatch, attach_gateway_executor):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
@@ -82,7 +82,7 @@ class TestReasoningCommand:
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         runner._reasoning_config = {"enabled": True, "effort": "xhigh"}
         runner._show_reasoning = False
 
@@ -97,7 +97,8 @@ class TestReasoningCommand:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])
     async def test_handle_reasoning_command_accepts_extended_efforts(
-        self, tmp_path, monkeypatch, effort
+        self, tmp_path, monkeypatch, effort,
+        attach_gateway_executor,
     ):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -106,7 +107,7 @@ class TestReasoningCommand:
         )
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         event = _make_event(f"/reasoning {effort}")
         session_key = runner._session_key_for_source(event.source)
 
@@ -118,14 +119,14 @@ class TestReasoningCommand:
         }
 
 
-    def test_resolve_session_reasoning_prefers_session_override(self, tmp_path, monkeypatch):
+    def test_resolve_session_reasoning_prefers_session_override(self, tmp_path, monkeypatch, attach_gateway_executor):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: low\n", encoding="utf-8")
 
         monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
 
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
         source = _make_event("/reasoning").source
         session_key = runner._session_key_for_source(source)
         runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "xhigh"}
@@ -133,7 +134,7 @@ class TestReasoningCommand:
         assert runner._resolve_session_reasoning_config(source=source) == {"enabled": True, "effort": "xhigh"}
 
 
-    def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch):
+    def test_run_agent_includes_enabled_mcp_servers_in_gateway_toolsets(self, tmp_path, monkeypatch, attach_gateway_executor):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text(
@@ -164,7 +165,7 @@ class TestReasoningCommand:
         monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
         _CapturingAgent.last_init = None
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
 
         source = SessionSource(
             platform=Platform.LOCAL,
@@ -216,4 +217,3 @@ class TestLoadShowReasoningCoercion:
             tmp_path, monkeypatch,
             'display:\n  show_reasoning: true\n',
         ) is True
-

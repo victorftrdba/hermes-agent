@@ -90,7 +90,7 @@ class TestSlashCommandsOnUnreadableTranscript:
         assert "not a new conversation" in HISTORY_UNREADABLE
 
     @pytest.mark.asyncio
-    async def test_btw_replies_history_unreadable_on_read_failure(self):
+    async def test_btw_replies_history_unreadable_on_read_failure(self, attach_gateway_executor):
         """The except-branch must actually run: after the Sep 2026 decomposition the
         constant lived in slash_commands_status but was not imported by slash_commands,
         so this path raised NameError (#102117 follow-up)."""
@@ -99,7 +99,7 @@ class TestSlashCommandsOnUnreadableTranscript:
         from gateway.slash_commands_status import HISTORY_UNREADABLE
         from tests.gateway.test_background_command import _make_event, _make_runner
 
-        runner = _make_runner()
+        runner = _make_runner(attach_gateway_executor)
         store = AsyncMock()
         store.get_or_create_session.return_value = MagicMock(session_id="s1")
         store.load_transcript.side_effect = TranscriptReadError("malformed")

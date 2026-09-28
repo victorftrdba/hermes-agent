@@ -56,8 +56,8 @@ def _install_fake_agent(monkeypatch):
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
 
-def _make_runner():
-    runner = object.__new__(gateway_run.GatewayRunner)
+def _make_runner(attach_gateway_executor):
+    runner = attach_gateway_executor(object.__new__(gateway_run.GatewayRunner))
     runner.adapters = {}
     runner._ephemeral_system_prompt = ""
     runner._prefill_messages = []
@@ -119,7 +119,7 @@ def _setup_monkeypatches(monkeypatch, tmp_path):
     monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
 
 
-def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
+def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path, attach_gateway_executor):
     """A voice-input turn must complete without a _streaming_tts_consumer NameError.
 
     The streaming-TTS consumer setup is entered (voice input + auto-TTS),
@@ -128,7 +128,7 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     reading ``streaming_tts_consumer_holder``.
     """
     _setup_monkeypatches(monkeypatch, tmp_path)
-    runner = _make_runner()
+    runner = _make_runner(attach_gateway_executor=attach_gateway_executor)
 
     # No adapter for this source → consumer setup skipped, but the outer
     # finalisation path still runs with streaming_tts_consumer_holder[0]=None.
@@ -152,5 +152,4 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
 
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
-
 

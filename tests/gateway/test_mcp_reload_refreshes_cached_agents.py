@@ -38,13 +38,13 @@ def _make_event() -> MessageEvent:
     return MessageEvent(text="/reload-mcp", source=_make_source(), message_id="m1")
 
 
-def _make_runner_with_cached_agents(num_agents: int = 2):
+def _make_runner_with_cached_agents(num_agents: int = 2, *, attach_gateway_executor):
     """Build a bare GatewayRunner with `num_agents` fake cached agents."""
     import threading
 
     from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.config = GatewayConfig(
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
@@ -83,10 +83,10 @@ def _make_runner_with_cached_agents(num_agents: int = 2):
 
 
 @pytest.mark.asyncio
-async def test_reload_mcp_refreshes_cached_agent_tools():
+async def test_reload_mcp_refreshes_cached_agent_tools(attach_gateway_executor):
     """After /reload-mcp succeeds, every cached agent gets its tool list
     replaced with the freshly-discovered set."""
-    runner = _make_runner_with_cached_agents(num_agents=3)
+    runner = _make_runner_with_cached_agents(num_agents=3, attach_gateway_executor=attach_gateway_executor)
 
     # Snapshot the stale state so we can assert it changed.
     pre_reload_tools = {
@@ -130,9 +130,9 @@ async def test_reload_mcp_refreshes_cached_agent_tools():
 
 
 @pytest.mark.asyncio
-async def test_reload_mcp_handles_empty_agent_cache():
+async def test_reload_mcp_handles_empty_agent_cache(attach_gateway_executor):
     """Reload with no cached agents (e.g. fresh gateway) must not raise."""
-    runner = _make_runner_with_cached_agents(num_agents=0)
+    runner = _make_runner_with_cached_agents(num_agents=0, attach_gateway_executor=attach_gateway_executor)
     assert len(runner._agent_cache) == 0
 
     with (
@@ -147,11 +147,11 @@ async def test_reload_mcp_handles_empty_agent_cache():
 
 
 @pytest.mark.asyncio
-async def test_reload_mcp_preserves_per_agent_toolset_overrides():
+async def test_reload_mcp_preserves_per_agent_toolset_overrides(attach_gateway_executor):
     """If a cached agent was built with enabled_toolsets=["safe"], the
     refresh must pass that same list to get_tool_definitions so the agent
     doesn't silently gain disabled tools after a reload."""
-    runner = _make_runner_with_cached_agents(num_agents=1)
+    runner = _make_runner_with_cached_agents(num_agents=1, attach_gateway_executor=attach_gateway_executor)
     # Override the toolsets on the cached agent.
     agent, _sig = runner._agent_cache["session-0"]
     agent.enabled_toolsets = ["safe"]

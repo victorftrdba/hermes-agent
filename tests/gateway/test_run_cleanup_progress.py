@@ -143,10 +143,10 @@ class FailingAgent:
         }
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, attach_gateway_executor):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
-    runner = object.__new__(GatewayRunner)
+    runner = attach_gateway_executor(object.__new__(GatewayRunner))
     runner.adapters = {adapter.platform: adapter}
     runner._voice_mode = {}
     runner._prefill_messages = []
@@ -207,7 +207,7 @@ def _install_fakes(
 
 
 @pytest.mark.asyncio
-async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path):
+async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path, attach_gateway_executor):
     """Writable gateway agents must receive the configured checkpoint limits."""
     captured = {}
 
@@ -217,7 +217,7 @@ async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path)
             super().__init__(**kwargs)
 
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = _install_fakes(
         monkeypatch, CheckpointCaptureAgent, cleanup_on=False,
     )
@@ -253,11 +253,11 @@ async def test_messaging_agent_forwards_checkpoint_config(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
+async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path, attach_gateway_executor):
     """When a bg-review-style callback is already registered, the cleanup
     callback chains with it — both fire, neither clobbers the other."""
     adapter = CleanupCaptureAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, attach_gateway_executor=attach_gateway_executor)
     gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
