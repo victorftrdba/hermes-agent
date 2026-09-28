@@ -452,8 +452,10 @@ class TestDelegationCleanup:
         relay_host.unregister_subagent.assert_not_called()
 
     def test_timed_out_child_keeps_relay_session_until_its_turn_exits(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, request
     ):
+        import time
+        from concurrent.futures import wait
         from unittest.mock import MagicMock
 
         from agent import relay_runtime
@@ -466,7 +468,6 @@ class TestDelegationCleanup:
 
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
-        profile_token = set_hermes_home_override(profile_home)
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
@@ -513,11 +514,14 @@ class TestDelegationCleanup:
 
         child.run_conversation.side_effect = run_conversation
         test_thread_id = threading.get_ident()
+        observed_futures = []
         captured_futures = []
         start_gates = []
         real_submit = DaemonThreadPoolExecutor.submit
 
         def submit(executor, fn, /, *args, **kwargs):
+            future = real_submit(executor, fn, *args, **kwargs)
+            observed_futures.append(future)
             caller = sys._getframe(1)
             intended_child = (
                 not captured_futures
@@ -527,13 +531,13 @@ class TestDelegationCleanup:
                 and caller.f_globals.get("__name__") == "tools.delegate_tool_child_run"
                 and getattr(caller.f_locals.get("self"), "child", None) is child
             )
-            future = real_submit(executor, fn, *args, **kwargs)
             if intended_child:
                 captured_futures.append(future)
                 start_gates.append(child_started.wait(timeout=5))
             return future
 
         monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit)
+        profile_token = set_hermes_home_override(profile_home)
         try:
             result = _run_single_child(
                 task_index=0,
@@ -558,13 +562,66 @@ class TestDelegationCleanup:
                 session_id=child.session_id,
             )
         finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_errors = []
+            quiescent = False
             release_child.set()
-            assert len(captured_futures) == 1
-            future = captured_futures[0]
             try:
-                future.result(timeout=5)
-                assert all(future.done() for future in captured_futures)
-            finally:
-                if future.done():
+                try:
                     reset_hermes_home_override(profile_token)
+                except BaseException as restoration_error:
+                    cleanup_errors.append(restoration_error)
+                finally:
+                    deadline = time.monotonic() + 5
+                    while pending := {future for future in observed_futures if not future.done()}:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        wait(pending, timeout=remaining)
+                    for future in observed_futures:
+                        if future.done():
+                            try:
+                                future.result()
+                            except BaseException as worker_error:
+                                cleanup_errors.append(worker_error)
+                    work_done = (
+                        bool(observed_futures)
+                        and all(future.done() for future in observed_futures)
+                        and child_finished.is_set()
+                    )
+                    active_turn = (
+                        relay_runtime.SESSION_COORDINATOR.has_active_turn(
+                            profile_key=str(profile_home),
+                            session_id=child.session_id,
+                        ) if work_done else None
+                    )
+                    quiescent = work_done and active_turn is False
+                    if not quiescent:
+                        request.session.shouldstop = (
+                            "Timed-out child cleanup not quiescent: "
+                            f"observed={len(observed_futures)}, "
+                            f"pending={sum(not future.done() for future in observed_futures)}, "
+                            f"child_finished={child_finished.is_set()}, active_turn={active_turn}"
+                        )
+                    assert quiescent, request.session.shouldstop
                     relay_runtime._reset_for_tests()
+                    assert len(captured_futures) == 1
+                    assert all(future.done() for future in captured_futures)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                if not quiescent and not request.session.shouldstop:
+                    request.session.shouldstop = (
+                        f"Timed-out child cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if cleanup_errors:
+                if primary_error is not None:
+                    for cleanup_error in cleanup_errors:
+                        primary_error.add_note(
+                            f"Timed-out child cleanup failed: {type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                else:
+                    for cleanup_error in cleanup_errors[1:]:
+                        cleanup_errors[0].add_note(
+                            f"Additional cleanup failure: {type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise cleanup_errors[0]
