@@ -26,6 +26,7 @@ wall-clock comparison. Event ordering cannot be defeated by a coarse clock.
 """
 
 import asyncio
+import threading
 
 import pytest
 
@@ -286,3 +287,103 @@ class TestTelegramColdStartCap:
         assert Platform.DISCORD in runner.adapters
         assert Platform.TELEGRAM not in runner.adapters
         assert Platform.TELEGRAM in runner._failed_platforms
+
+
+@pytest.mark.asyncio
+async def test_connecting_status_write_runs_off_event_loop(monkeypatch, tmp_path):
+    """``_connect_one_startup``'s connecting status write must not run on the loop.
+
+    The write is a synchronous read-modify-write against ``gateway_state.json``; running
+    it inline would stall every concurrent platform connect (the #83791 regression
+    class). The sync helper is parked on a ``threading.Event``, so an asyncio probe can
+    only advance if the write left the loop.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _OrderRecorder.reset()
+
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+
+    def _blocking_status_write(platform, **kwargs):
+        writer_entered.set()
+        assert writer_release.wait(timeout=30), "test never released the runtime-status write"
+
+    monkeypatch.setattr(runner, "_update_platform_runtime_status", _blocking_status_write)
+
+    adapter = _TimingAdapter(Platform.TELEGRAM, 0.0)
+    probe_ran = asyncio.Event()
+
+    async def _probe():
+        await asyncio.to_thread(writer_entered.wait, 30)
+        probe_ran.set()
+
+    probe_task = asyncio.ensure_future(_probe())
+    connect_task = asyncio.ensure_future(
+        runner._start_connect_pending(
+            [(Platform.TELEGRAM, config.platforms[Platform.TELEGRAM], adapter)]
+        )
+    )
+    try:
+        await asyncio.wait_for(probe_ran.wait(), timeout=10)
+        assert writer_entered.is_set(), "status write never started"
+        assert not connect_task.done(), "connect finished while the status writer was blocked"
+    finally:
+        writer_release.set()
+
+    await probe_task
+    results = await asyncio.wait_for(connect_task, timeout=30)
+
+    assert results is not None, "connect loop aborted unexpectedly"
+    assert results[0][3] == "ok"
+    assert _OrderRecorder.index_of(Platform.TELEGRAM.value, "end") != -1
+
+
+@pytest.mark.asyncio
+async def test_async_platform_status_updates_complete_off_loop_and_retain_entries(
+    monkeypatch, tmp_path
+):
+    """Concurrent async status updates both land off-loop and persist every platform entry.
+
+    The sync write helper is observed through a wrapper while the real read-modify-write
+    runs against the temp HERMES_HOME. Serialization comes from the RLock inside
+    ``gateway.status.write_runtime_status``, so both platform entries must survive.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    import gateway.run as gateway_run
+    from gateway.status import read_runtime_status
+
+    config = GatewayConfig(platforms={}, sessions_dir=tmp_path / "sessions")
+    runner = GatewayRunner(config)
+
+    loop_thread = threading.get_ident()
+    real_quiet_write = gateway_run._write_runtime_status_quiet
+    writer_threads: list = []
+    written_platforms: list = []
+    calls_guard = threading.Lock()
+
+    def _tracking_quiet_write(**fields):
+        with calls_guard:
+            writer_threads.append(threading.get_ident())
+            written_platforms.append(str(fields.get("platform")))
+        real_quiet_write(**fields)
+
+    monkeypatch.setattr(gateway_run, "_write_runtime_status_quiet", _tracking_quiet_write)
+
+    await asyncio.gather(
+        runner._update_platform_runtime_status_async("telegram", platform_state="connecting"),
+        runner._update_platform_runtime_status_async("discord", platform_state="connecting"),
+    )
+
+    assert sorted(written_platforms) == ["discord", "telegram"]
+    assert all(tid != loop_thread for tid in writer_threads), "status write ran on the event loop"
+    record = read_runtime_status()
+    assert record is not None
+    assert record["platforms"]["telegram"]["state"] == "connecting"
+    assert record["platforms"]["discord"]["state"] == "connecting"
