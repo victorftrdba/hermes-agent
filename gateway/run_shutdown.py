@@ -695,6 +695,20 @@ class GatewayShutdownMixin:
             error_message=error_message, **extra,
         )
 
+    async def _update_platform_runtime_status_async(
+        self, platform: str, *, platform_state: Optional[str] = None,
+        error_code: Optional[str] = None, error_message: Optional[str] = None,
+        needs_attention: Optional[bool] = None, retrying_since: Any = _UNSET,
+    ) -> None:
+        """Off-loop variant of :meth:`_update_platform_runtime_status`: the status write is a
+        synchronous read-modify-write and must not block the event loop. Best-effort is preserved
+        because the sync helper already routes through ``_write_runtime_status_quiet``."""
+        await asyncio.to_thread(
+            self._update_platform_runtime_status, platform,
+            platform_state=platform_state, error_code=error_code, error_message=error_message,
+            needs_attention=needs_attention, retrying_since=retrying_since,
+        )
+
     # Per-platform circuit breaker (pause/resume): reconnect watcher + /platform pause|resume.
     def _pause_failed_platform(self, platform, *, reason: str = "") -> None:
         """Pause a queued platform (manual ``/platform pause`` only — the watcher never auto-pauses)."""

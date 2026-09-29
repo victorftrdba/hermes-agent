@@ -997,7 +997,7 @@ class GatewayStartupMixin:
             if await self._abort_startup_if_shutdown_requested(adp, p):
                 return (p, adp, p_cfg, "aborted", None)
             logger.info("Connecting to %s...", p.value)
-            self._update_platform_runtime_status(
+            await self._update_platform_runtime_status_async(
                 p.value, platform_state="connecting", error_code=None, error_message=None,
             )
             try:

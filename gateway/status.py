@@ -40,6 +40,9 @@ _gateway_lock_handle = None
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
 _GATEWAY_RUNNING_PID_CACHE_TTL_SECONDS = 1.0
 _gateway_running_pid_cache_lock = threading.Lock()
+# Serializes the ``write_runtime_status`` read-modify-write round: concurrent writers (workers
+# dispatched through ``asyncio.to_thread``) must not clobber each other's platform entries.
+_runtime_status_write_lock = threading.RLock()
 # key: (pid_path, cleanup_stale, include_runtime_status) -> (cached_at, file signature, pid)
 _gateway_running_pid_cache: dict[tuple[str, bool, bool], tuple[float, tuple, Optional[int]]] = {}
 
@@ -798,51 +801,52 @@ def write_runtime_status(
     clear_profile_platforms: bool = False,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
-    path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    previous_payload = copy.deepcopy(payload)
-    current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
-    if clear_profile_platforms:
-        # Secondary-profile entries are keyed ``<profile>:<platform>``. A fresh process must not
-        # inherit them or /api/status stays degraded until every old adapter re-emits.
-        platforms = payload["platforms"] if isinstance(payload["platforms"], dict) else {}
-        payload["platforms"] = {
-            k: v for k, v in platforms.items() if not isinstance(k, str) or ":" not in k
-        }
-    # Re-stamp identity + code fields on every write: the file can outlive its creator and the
-    # top-level record must describe the CURRENT writer.
-    payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
-    payload["updated_at"] = _utc_now_iso()
-    payload.update(_get_code_identity_fields())
-    _apply_set_fields(payload, (
-        ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
-        ("restart_requested", restart_requested, bool),
-        ("active_agents", active_agents, parse_active_agents),
-        # Multiplexed profiles; absent/empty for a single-profile gateway.
-        ("served_profiles", served_profiles, lambda v: list(v or [])),
-        ("session_store", session_store, _coerce_session_store),
-    ))
-    if platform is not _UNSET:
-        platform_payload = payload["platforms"].get(platform, {})
-        _apply_set_fields(platform_payload, (
-            ("state", platform_state, None), ("error_code", error_code, None),
-            ("error_message", error_message, None),
-            # Reconnect-loop escalation past the attention threshold: a signal for owners/fleet
-            # monitoring, not a circuit breaker (retry never stops). Cleared on reconnect.
-            ("needs_attention", needs_attention, bool),
-            # ISO start of the current retry episode; None clears it.
-            ("retrying_since", retrying_since, None),
+    with _runtime_status_write_lock:
+        path = _get_runtime_status_path()
+        payload = _read_json_file(path) or _build_runtime_status_record()
+        previous_payload = copy.deepcopy(payload)
+        current_record = _build_pid_record()
+        payload.setdefault("platforms", {})
+        if clear_profile_platforms:
+            # Secondary-profile entries are keyed ``<profile>:<platform>``. A fresh process must not
+            # inherit them or /api/status stays degraded until every old adapter re-emits.
+            platforms = payload["platforms"] if isinstance(payload["platforms"], dict) else {}
+            payload["platforms"] = {
+                k: v for k, v in platforms.items() if not isinstance(k, str) or ":" not in k
+            }
+        # Re-stamp identity + code fields on every write: the file can outlive its creator and the
+        # top-level record must describe the CURRENT writer.
+        payload.update({key: current_record[key] for key in ("kind", "pid", "argv", "start_time")})
+        payload["updated_at"] = _utc_now_iso()
+        payload.update(_get_code_identity_fields())
+        _apply_set_fields(payload, (
+            ("gateway_state", gateway_state, None), ("exit_reason", exit_reason, None),
+            ("restart_requested", restart_requested, bool),
+            ("active_agents", active_agents, parse_active_agents),
+            # Multiplexed profiles; absent/empty for a single-profile gateway.
+            ("served_profiles", served_profiles, lambda v: list(v or [])),
+            ("session_store", session_store, _coerce_session_store),
         ))
-        # Per-entry writer provenance: top-level pid/start_time only identify the most recent
-        # writer; /api/status tells "live" from "preserved" by exact (pid, start_time) equality.
-        platform_payload.update(updated_at=_utc_now_iso(), writer_pid=current_record["pid"],
-                                writer_start_time=current_record["start_time"])
-        payload["platforms"][platform] = platform_payload
-    _write_json_file(path, payload)
-    with contextlib.suppress(Exception):
-        from agent.monitoring.gateway_health import emit_runtime_status_transition
-        emit_runtime_status_transition(previous_payload, payload)
+        if platform is not _UNSET:
+            platform_payload = payload["platforms"].get(platform, {})
+            _apply_set_fields(platform_payload, (
+                ("state", platform_state, None), ("error_code", error_code, None),
+                ("error_message", error_message, None),
+                # Reconnect-loop escalation past the attention threshold: a signal for owners/fleet
+                # monitoring, not a circuit breaker (retry never stops). Cleared on reconnect.
+                ("needs_attention", needs_attention, bool),
+                # ISO start of the current retry episode; None clears it.
+                ("retrying_since", retrying_since, None),
+            ))
+            # Per-entry writer provenance: top-level pid/start_time only identify the most recent
+            # writer; /api/status tells "live" from "preserved" by exact (pid, start_time) equality.
+            platform_payload.update(updated_at=_utc_now_iso(), writer_pid=current_record["pid"],
+                                    writer_start_time=current_record["start_time"])
+            payload["platforms"][platform] = platform_payload
+        _write_json_file(path, payload)
+        with contextlib.suppress(Exception):
+            from agent.monitoring.gateway_health import emit_runtime_status_transition
+            emit_runtime_status_transition(previous_payload, payload)
 
 
 def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]:
