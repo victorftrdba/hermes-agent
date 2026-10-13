@@ -139,7 +139,7 @@ DEFAULT_SILENCE_NARRATION_MAX_LENGTH = 64
 def _coerce_silence_phrases(value: Any) -> list[str]:
     """Declared silence-narration phrases: trimmed non-empty strings only. A wrong container type
     or an unusable entry is ignored — a broken config must never break message delivery."""
-    if not isinstance(value, list):
+    if not isinstance(value, (list, tuple)):
         return []
     return [p.strip() for p in value if isinstance(p, str) and p.strip()]
 

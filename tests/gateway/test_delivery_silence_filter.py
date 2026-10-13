@@ -409,3 +409,16 @@ def test_config_yaml_declaration_reaches_the_gateway_config(tmp_path, monkeypatc
     assert config.silence_narration_max_length == 140
 
 
+def test_declared_phrases_are_literal_not_regex():
+    phrase = "a.b|c (check)?"
+    assert _is_silence_narration(phrase, phrases=[phrase])
+    assert not _is_silence_narration("axb|c check", phrases=[phrase])
+    assert not _is_silence_narration("prefix " + phrase, phrases=[phrase])
+
+
+def test_raw_and_loaded_length_declarations_have_the_same_contract():
+    config = GatewayConfig.from_dict({"silence_narration_max_length": "140"})
+    assert _is_silence_narration("." * 70, max_length="140")
+    assert _is_silence_narration("." * 70, max_length=config.silence_narration_max_length)
+
+

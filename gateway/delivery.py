@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any
 
 from hermes_cli.config import get_hermes_home
 
-from .config import DEFAULT_SILENCE_NARRATION_MAX_LENGTH, Platform, GatewayConfig, PlatformConfig
+from .config import Platform, GatewayConfig, PlatformConfig, _coerce_silence_phrases, _coerce_silence_length
 from .session import SessionSource
 from .dead_targets import DeadTargetRegistry, classify_dead_error
 
@@ -31,15 +31,6 @@ _SILENCE_NARRATION = re.compile(
 _THREAD_ROUTING_KEYS = ("thread_id", "message_thread_id", "direct_messages_topic_id", "telegram_direct_messages_topic_id")
 
 
-def _declared_silence_phrases(value: Any) -> tuple[str, ...]:
-    """Usable entries of a declared silence vocabulary: trimmed non-empty strings. Anything else —
-    a wrong container type, a non-string or blank entry — is ignored, so a malformed config degrades
-    to the shipped class instead of raising mid-delivery."""
-    if not isinstance(value, (list, tuple)):
-        return ()
-    return tuple(p.strip() for p in value if isinstance(p, str) and p.strip())
-
-
 def _silence_narration_pattern(phrases: tuple[str, ...]) -> re.Pattern:
     """The shipped English class widened with *phrases*, which match like the built-ins: escaped
     (a declared phrase is literal text, never raw regex), whole message only, under the same
@@ -52,13 +43,6 @@ def _silence_narration_pattern(phrases: tuple[str, ...]) -> re.Pattern:
     )
 
 
-def _silence_length_guard(value: Any) -> int:
-    """Declared length guard for a silence narration; an unusable value (missing, non-int, bool,
-    non-positive) falls back to the shipped default so a broken config never breaks delivery."""
-    return (value if isinstance(value, int) and not isinstance(value, bool) and value > 0
-            else DEFAULT_SILENCE_NARRATION_MAX_LENGTH)
-
-
 def _is_silence_narration(content: Optional[str], *, phrases: Any = None,
                           max_length: Any = None) -> bool:
     """True when ``content`` is *only* a silence-narration token (length-guarded).
@@ -69,9 +53,9 @@ def _is_silence_narration(content: Optional[str], *, phrases: Any = None,
     counts *beside* the built-ins and matches only as the whole message.
     """
     stripped = content.strip() if content else ""
-    declared = _declared_silence_phrases(phrases)
+    declared = tuple(_coerce_silence_phrases(phrases))
     pattern = _silence_narration_pattern(declared) if declared else _SILENCE_NARRATION
-    return bool(stripped) and len(stripped) <= _silence_length_guard(max_length) and bool(pattern.match(stripped))
+    return bool(stripped) and len(stripped) <= _coerce_silence_length(max_length) and bool(pattern.match(stripped))
 
 
 class PartialDeliveryError(RuntimeError):
