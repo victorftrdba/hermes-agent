@@ -142,3 +142,20 @@ def test_language_config_failure_degrades_to_todays_prompt(compressor, monkeypat
     assert summary_language_directive("Plain English text.") == ""
     prompt = _capture_summary_prompt(compressor, _english_turns())
     assert _NO_DIRECTIVE_MARKER not in prompt
+
+
+def test_sample_extraction_failure_degrades_without_breaking_compaction(monkeypatch):
+    def unavailable(_content):
+        raise RuntimeError("sample unavailable")
+
+    monkeypatch.setattr("agent.context_compressor._content_text_for_contains", unavailable)
+    assert transcript_language_sample(_english_turns()) == ""
+
+
+@pytest.mark.parametrize("previous", [None, "Previous completed checkpoint"])
+def test_focus_and_iterative_prompt_keep_the_language_directive_last(compressor, previous):
+    compressor._previous_summary = previous
+    prompt = compressor._build_summary_prompt("source turns", 200, "language regression", "", True,
+                                              "请检查这个摘要的问题。")
+    assert 'FOCUS TOPIC: "language regression"' in prompt
+    assert prompt.endswith("Write every section below in Chinese (中文) — the conversation is in Chinese.")

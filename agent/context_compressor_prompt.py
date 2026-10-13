@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import unicodedata
 from typing import Any
 
 from agent.context_engine import sanitize_memory_context
@@ -122,19 +121,23 @@ def transcript_language_sample(messages: list[dict[str, Any]]) -> str:
 
     user_text: list[str] = []
     assistant_text: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role")
-        if role == "user" and not ContextCompressor._is_synthetic_compression_user_turn(message):
-            target = user_text
-        elif role == "assistant":
-            target = assistant_text
-        else:
-            continue
-        text = _content_text_for_contains(message.get("content"))
-        if text.strip():
-            target.append(text)
+    try:
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "user" and not ContextCompressor._is_synthetic_compression_user_turn(message):
+                target = user_text
+            elif role == "assistant":
+                target = assistant_text
+            else:
+                continue
+            text = _content_text_for_contains(message.get("content"))
+            if text.strip():
+                target.append(text)
+    except Exception:
+        logger.debug("Summary language sample skipped", exc_info=True)
+        return ""
     return "\n".join(user_text or assistant_text)
 
 
