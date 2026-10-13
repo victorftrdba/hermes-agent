@@ -99,6 +99,11 @@ _TOPLEVEL_BRIDGE: tuple = (
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s", "loop_watchdog_max_strikes",
         "filter_silence_narration",
     ),
+    # Declared silence-narration vocabulary + length guard (#135444); carried raw —
+    # GatewayConfig.from_dict normalizes and ignores unusable values.
+    ("silence_narration_phrases", "silence_narration_phrases", "none", lambda v: isinstance(v, list), None),
+    ("silence_narration_max_length", "silence_narration_max_length", "none",
+     lambda v: isinstance(v, (int, float, str)) and not isinstance(v, bool), None),
     ("unauthorized_dm_behavior", "unauthorized_dm_behavior", "presence", None, _dm_behavior_choice),
     *_presence("unauthorized_dm_decline_message"),
 )

@@ -131,6 +131,29 @@ def _coerce_optional_positive_int(value: Any, key: str) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+# Declared length guard for the silence-narration filter (``silence_narration_max_length``): the
+# implicit 64 chars today, declared so a non-English instance can carry a longer narration.
+DEFAULT_SILENCE_NARRATION_MAX_LENGTH = 64
+
+
+def _coerce_silence_phrases(value: Any) -> list[str]:
+    """Declared silence-narration phrases: trimmed non-empty strings only. A wrong container type
+    or an unusable entry is ignored — a broken config must never break message delivery."""
+    if not isinstance(value, list):
+        return []
+    return [p.strip() for p in value if isinstance(p, str) and p.strip()]
+
+
+def _coerce_silence_length(value: Any) -> int:
+    """Declared length guard: a positive integer (numeric strings coerce). An unusable value falls
+    back to the shipped default — bool included, since ``int(True)`` is 1 and would silently
+    disable the guard."""
+    if isinstance(value, bool):
+        return DEFAULT_SILENCE_NARRATION_MAX_LENGTH
+    length = _coerce_int(value, DEFAULT_SILENCE_NARRATION_MAX_LENGTH)
+    return length if length > 0 else DEFAULT_SILENCE_NARRATION_MAX_LENGTH
+
+
 _SYSTEMD_WATCHDOG_MAX_SECONDS = 2_147_483_647
 
 
@@ -597,6 +620,10 @@ class GatewayConfig:
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
     filter_silence_narration: bool = True
+    # Declared vocabulary/guard for instances that do not narrate silence in English: extra literal
+    # phrases matched whole-message beside the built-ins, and the length they match under.
+    silence_narration_phrases: list[str] = field(default_factory=list)
+    silence_narration_max_length: int = DEFAULT_SILENCE_NARRATION_MAX_LENGTH
     stt_enabled: bool = True  # Auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Echo raw STT transcripts back to the user
     group_sessions_per_user: bool = True  # Isolate group sessions per participant when user IDs exist
@@ -797,6 +824,8 @@ class GatewayConfig:
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
+            silence_narration_phrases=_coerce_silence_phrases(pick("silence_narration_phrases")),
+            silence_narration_max_length=_coerce_silence_length(pick("silence_narration_max_length")),
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),
